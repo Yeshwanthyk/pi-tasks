@@ -127,11 +127,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Resolve a subagent lifecycle event to its current task execution, even after in-memory maps are lost. */
-  function findTaskForAgent(agentId: string): { taskId: string; executionId?: string } | undefined {
+  function findTaskForAgent(agentId: string, opts?: { allowCompleted?: boolean }): { taskId: string; executionId?: string } | undefined {
     const mapped = agentTaskMap.get(agentId);
     if (mapped) {
       const task = store.get(mapped.taskId);
-      if (task?.status === "in_progress" && task.metadata?.executionId === mapped.executionId) return mapped;
+      const statusMatches = task?.status === "in_progress" || (opts?.allowCompleted && task?.status === "completed");
+      if (statusMatches && task?.metadata?.executionId === mapped.executionId) return mapped;
       return undefined;
     }
     const task = store.list().find(t =>
@@ -231,7 +232,10 @@ export default function (pi: ExtensionAPI) {
       );
       for (const next of unblocked) {
         const executionId = randomUUID();
-        store.update(next.id, { status: "in_progress", metadata: { executionId, startedAt: Date.now() } });
+        store.update(next.id, {
+          status: "in_progress",
+          metadata: { executionId, startedAt: Date.now(), agentId: null, completedAt: null, stopRequestedAt: null },
+        });
         const prompt = buildTaskPrompt(next, cascadeConfig.additionalContext);
         try {
           const agentId = await spawnSubagent(next.metadata.agentType, prompt, {
@@ -244,7 +248,10 @@ export default function (pi: ExtensionAPI) {
           store.update(next.id, { owner: agentId, metadata: { agentId } });
           widget.setActiveTask(next.id);
         } catch (err: any) {
-          store.update(next.id, { status: "pending", metadata: { ...next.metadata, lastError: err.message } });
+          store.update(next.id, {
+            status: "pending",
+            metadata: { executionId: null, startedAt: null, agentId: null, lastError: err.message },
+          });
         }
       }
     }
@@ -256,7 +263,7 @@ export default function (pi: ExtensionAPI) {
   // Intentional stop (status === "stopped") → mark completed, preserve partial result
   pi.events.on("subagents:failed", (data) => {
     const { id, error, result, status } = data as { id: string; error?: string; result?: string; status: string };
-    const execution = findTaskForAgent(id);
+    const execution = findTaskForAgent(id, { allowCompleted: status === "stopped" });
     if (!execution) return;
     agentTaskMap.delete(id);
     const task = store.get(execution.taskId);
@@ -858,7 +865,7 @@ Set up task dependencies:
         }
         const task = store.get(resolvedId);
         if (task?.metadata?.agentId && task.status === "in_progress") {
-          store.update(resolvedId, { status: "completed" });
+          store.update(resolvedId, { status: "completed", metadata: { completedAt: Date.now(), stopRequestedAt: Date.now() } });
           autoClear.trackCompletion(resolvedId, currentTurn);
           await stopSubagent(task.metadata.agentId);
           widget.setActiveTask(resolvedId, false);
@@ -945,7 +952,10 @@ Set up task dependencies:
 
         // Mark in_progress and spawn agent via RPC
         const executionId = randomUUID();
-        store.update(taskId, { status: "in_progress", metadata: { executionId, startedAt: Date.now() } });
+        store.update(taskId, {
+          status: "in_progress",
+          metadata: { executionId, startedAt: Date.now(), agentId: null, completedAt: null, stopRequestedAt: null },
+        });
         const prompt = buildTaskPrompt(task, params.additional_context);
         try {
           const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
@@ -960,7 +970,7 @@ Set up task dependencies:
           launched.push(`#${taskId} → agent ${agentId}`);
         } catch (err: any) {
           debug(`spawn:error task=#${taskId}`, err);
-          store.update(taskId, { status: "pending" });
+          store.update(taskId, { status: "pending", metadata: { executionId: null, startedAt: null, agentId: null } });
           results.push(`#${taskId}: spawn failed — ${err.message}`);
         }
       }

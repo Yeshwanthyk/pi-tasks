@@ -89,7 +89,7 @@ function mockCtx() {
 // ---- Mock subagents extension (RPC responders) ----
 
 /** Simulates the @tintinweb/pi-subagents extension: responds to ping + spawn RPCs and emits ready. */
-function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?: string }) {
+function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?: string; onSpawnRequest?: () => void }) {
   let idCounter = 0;
   const spawned: Array<{ id: string; type: string; prompt: string; options: any }> = [];
   const stopped: string[] = [];
@@ -105,6 +105,7 @@ function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?
     const { requestId, type, prompt, options } = data as {
       requestId: string; type: string; prompt: string; options?: any;
     };
+    opts?.onSpawnRequest?.();
     if (opts?.spawnError) {
       pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: false, error: opts.spawnError });
       return;
@@ -426,6 +427,31 @@ describe("Completion listener", () => {
     expect(result.content[0].text).toContain("Status: completed");
     expect(result.content[0].text).not.toContain("late result");
   });
+
+  it("ignores stale old-agent events while retry spawn is in progress", async () => {
+    rpc.unsub();
+    mock = mockPi();
+    rpc = installSubagentsMock(mock.pi, {
+      onSpawnRequest: () => mock.emitEvent("subagents:completed", { id: "agent-old", result: "stale result" }),
+    });
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", {
+      subject: "Retry task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskUpdate", {
+      taskId: "1",
+      metadata: { agentId: "agent-old", executionId: "old-run" },
+    });
+
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: in_progress");
+    expect(result.content[0].text).not.toContain("stale result");
+  });
 });
 
 describe("Auto-cascade", () => {
@@ -737,6 +763,28 @@ describe("RPC protocol correctness", () => {
 
     const task = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(task.content[0].text).toContain("Status: completed");
+
+    rpc.unsub();
+  });
+
+  it("preserves stopped subagent partial result after TaskStop pre-completes the task", async () => {
+    const mock = mockPi();
+    const rpc = installSubagentsMock(mock.pi);
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", {
+      subject: "Stop with result",
+      description: "desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await mock.executeTool("TaskStop", { task_id: "1" });
+
+    mock.emitEvent("subagents:failed", { id: "agent-1", status: "stopped", result: "partial output" });
+
+    const task = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(task.content[0].text).toContain("Status: completed");
+    expect(task.content[0].text).toContain("partial output");
 
     rpc.unsub();
   });
