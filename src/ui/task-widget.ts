@@ -32,6 +32,7 @@ export type UICtx = {
 const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", "✼", "✽"];
 
 const MAX_VISIBLE_TASKS = 10;
+const MANUAL_TASK_STALE_AFTER_MS = 10 * 60 * 1000;
 
 /** Per-task runtime metrics (elapsed time, token usage). */
 export interface TaskMetrics {
@@ -77,6 +78,17 @@ export class TaskWidget {
 
   setStore(store: TaskStore) {
     this.store = store;
+    this.resetRuntimeState();
+  }
+
+  /** Clear transient animation/metrics state that must not survive store/session switches. */
+  resetRuntimeState() {
+    this.activeTaskIds.clear();
+    this.metrics.clear();
+    if (this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
+    }
   }
 
   setUICtx(ctx: UICtx) {
@@ -140,7 +152,11 @@ export class TaskWidget {
     const visible = tasks.slice(0, MAX_VISIBLE_TASKS);
     for (let i = 0; i < visible.length; i++) {
       const task = visible[i];
-      const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress";
+      const metric = this.metrics.get(task.id);
+      const startedAt = typeof task.metadata?.startedAt === "number" ? task.metadata.startedAt : metric?.startedAt;
+      const isStaleManual = task.status === "in_progress" && !task.metadata?.agentId &&
+        typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
+      const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress" && !isStaleManual;
 
       let icon: string;
       if (isActive) {
@@ -169,7 +185,7 @@ export class TaskWidget {
         const form = task.activeForm || task.subject;
         const agentId = task.metadata?.agentId;
         const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
-        const m = this.metrics.get(task.id);
+        const m = metric;
         let stats = "";
         if (m) {
           const elapsed = formatDuration(Date.now() - m.startedAt);
@@ -187,7 +203,10 @@ export class TaskWidget {
         const agentSuffix = task.status === "in_progress" && task.metadata?.agentId
           ? theme.fg("dim", ` (agent ${task.metadata.agentId.slice(0, 5)})`)
           : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}`;
+        const staleSuffix = isStaleManual && typeof startedAt === "number"
+          ? theme.fg("warning", ` (stale ${formatDuration(Date.now() - startedAt)})`)
+          : "";
+        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}${staleSuffix}`;
       }
 
       lines.push(truncate(text + suffix));
@@ -228,7 +247,13 @@ export class TaskWidget {
     }
 
     // Check if any task needs animation
-    const hasActiveSpinner = tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
+    const hasActiveSpinner = tasks.some(t => {
+      const metric = this.metrics.get(t.id);
+      const startedAt = typeof t.metadata?.startedAt === "number" ? t.metadata.startedAt : metric?.startedAt;
+      const isStaleManual = !t.metadata?.agentId &&
+        typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
+      return this.activeTaskIds.has(t.id) && t.status === "in_progress" && !isStaleManual;
+    });
     if (hasActiveSpinner) {
       this.ensureTimer();
     } else if (!hasActiveSpinner && this.widgetInterval) {

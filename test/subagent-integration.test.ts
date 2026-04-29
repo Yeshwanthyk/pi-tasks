@@ -369,6 +369,63 @@ describe("Completion listener", () => {
     const result = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(result.content[0].text).toContain("Status: pending");
   });
+
+  it("falls back to persisted metadata.agentId when completion map is unavailable", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Mapped elsewhere",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskUpdate", {
+      taskId: "1",
+      status: "in_progress",
+      metadata: { agentId: "agent-recovered" },
+    });
+
+    mock.emitEvent("subagents:completed", { id: "agent-recovered", result: "done" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: completed");
+    expect(result.content[0].text).toContain("done");
+  });
+
+  it("falls back to persisted metadata.agentId for failed events", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Recovered failure",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskUpdate", {
+      taskId: "1",
+      status: "in_progress",
+      metadata: { agentId: "agent-failed" },
+    });
+
+    mock.emitEvent("subagents:failed", { id: "agent-failed", error: "boom", status: "error" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: pending");
+    expect(result.content[0].text).toContain("boom");
+  });
+
+  it("ignores stale completion events once the task is no longer in progress", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Already done",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskUpdate", {
+      taskId: "1",
+      status: "completed",
+      metadata: { agentId: "agent-old", executionId: "old-run" },
+    });
+
+    mock.emitEvent("subagents:completed", { id: "agent-old", result: "late result" });
+
+    const result = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(result.content[0].text).toContain("Status: completed");
+    expect(result.content[0].text).not.toContain("late result");
+  });
 });
 
 describe("Auto-cascade", () => {
@@ -658,6 +715,28 @@ describe("RPC protocol correctness", () => {
     const result = await mock.executeTool("TaskStop", { task_id: "1" });
     expect(result.content[0].text).toContain("stopped successfully");
     expect(rpc.stopped).toContain("agent-1");
+
+    rpc.unsub();
+  });
+
+  it("TaskStop updates the resolved task when called by agent ID", async () => {
+    const mock = mockPi();
+    const rpc = installSubagentsMock(mock.pi);
+    initExtension(mock.pi as any);
+
+    await mock.executeTool("TaskCreate", {
+      subject: "Stop by agent",
+      description: "desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    const result = await mock.executeTool("TaskStop", { task_id: "agent-1" });
+    expect(result.content[0].text).toContain("stopped successfully");
+    expect(rpc.stopped).toContain("agent-1");
+
+    const task = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(task.content[0].text).toContain("Status: completed");
 
     rpc.unsub();
   });

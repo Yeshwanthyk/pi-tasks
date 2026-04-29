@@ -111,6 +111,47 @@ describe("TaskWidget", () => {
     expect(lines[1]).not.toContain("◼");
   });
 
+  it("clears active runtime state when switching stores", () => {
+    store.create("Old active", "Desc", "Old running");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1", true);
+
+    const nextStore = new TaskStore();
+    nextStore.create("New task same id", "Desc", "New running");
+    nextStore.update("1", { status: "in_progress" });
+    widget.setStore(nextStore);
+    widget.update();
+
+    const lines = renderWidget(ui.state);
+    expect(lines[1]).toContain("◼");
+    expect(lines[1]).toContain("New task same id");
+    expect(lines[1]).not.toContain("New running…");
+  });
+
+  it("renders stale manual active tasks as non-spinning in progress", () => {
+    const startedAt = Date.now() - 11 * 60 * 1000;
+    store.create("Old manual task", "Desc", "Still running");
+    store.update("1", { status: "in_progress", metadata: { startedAt } });
+    widget.setActiveTask("1", true);
+
+    const lines = renderWidget(ui.state);
+    expect(lines[1]).toContain("◼");
+    expect(lines[1]).toContain("Old manual task");
+    expect(lines[1]).toContain("stale 11m");
+    expect(lines[1]).not.toContain("Still running…");
+  });
+
+  it("keeps agent-backed active tasks spinning even after stale threshold", () => {
+    const startedAt = Date.now() - 11 * 60 * 1000;
+    store.create("Old agent task", "Desc", "Agent running");
+    store.update("1", { status: "in_progress", metadata: { startedAt, agentId: "agent-12345" } });
+    widget.setActiveTask("1", true);
+
+    const lines = renderWidget(ui.state);
+    expect(lines[1]).toContain("Agent running (agent agent)…");
+    expect(lines[1]).not.toContain("stale");
+  });
+
   it("shows blocked-by info for pending tasks", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");

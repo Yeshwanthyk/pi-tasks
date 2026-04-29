@@ -82,8 +82,8 @@ export default function (pi: ExtensionAPI) {
   let latestCtx: ExtensionContext | undefined;
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
-  /** Maps agent IDs to task IDs for O(1) completion lookup. */
-  const agentTaskMap = new Map<string, string>();
+  /** Maps agent IDs to their task execution for O(1), idempotent completion lookup. */
+  const agentTaskMap = new Map<string, { taskId: string; executionId: string }>();
 
   // ── Subagent RPC helpers ──
 
@@ -124,6 +124,20 @@ export default function (pi: ExtensionAPI) {
   /** Stop a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
   function stopSubagent(agentId: string): Promise<void> {
     return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
+  }
+
+  /** Resolve a subagent lifecycle event to its current task execution, even after in-memory maps are lost. */
+  function findTaskForAgent(agentId: string): { taskId: string; executionId?: string } | undefined {
+    const mapped = agentTaskMap.get(agentId);
+    if (mapped) {
+      const task = store.get(mapped.taskId);
+      if (task?.status === "in_progress" && task.metadata?.executionId === mapped.executionId) return mapped;
+      return undefined;
+    }
+    const task = store.list().find(t =>
+      t.status === "in_progress" && t.metadata?.agentId === agentId
+    );
+    return task ? { taskId: task.id, executionId: task.metadata?.executionId } : undefined;
   }
 
   // ── Subagent extension presence & version detection ──
@@ -198,13 +212,13 @@ export default function (pi: ExtensionAPI) {
   // Success → mark task completed, cascade if enabled
   pi.events.on("subagents:completed", async (data) => {
     const { id, result } = data as { id: string; result?: string };
-    const taskId = agentTaskMap.get(id);
-    if (!taskId) return;
+    const execution = findTaskForAgent(id);
+    if (!execution) return;
     agentTaskMap.delete(id);
-    const task = store.get(taskId);
+    const task = store.get(execution.taskId);
     if (!task) return;
 
-    store.update(task.id, { status: "completed", metadata: { ...task.metadata, result } });
+    store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, completedAt: Date.now() } });
     widget.setActiveTask(task.id, false);
 
     // Auto-cascade: find unblocked dependents with agentType
@@ -216,7 +230,8 @@ export default function (pi: ExtensionAPI) {
         t.blockedBy.every(depId => store.get(depId)?.status === "completed")
       );
       for (const next of unblocked) {
-        store.update(next.id, { status: "in_progress" });
+        const executionId = randomUUID();
+        store.update(next.id, { status: "in_progress", metadata: { executionId, startedAt: Date.now() } });
         const prompt = buildTaskPrompt(next, cascadeConfig.additionalContext);
         try {
           const agentId = await spawnSubagent(next.metadata.agentType, prompt, {
@@ -225,8 +240,8 @@ export default function (pi: ExtensionAPI) {
             maxTurns: cascadeConfig.maxTurns,
             ...(cascadeConfig.model ? { model: cascadeConfig.model } : {}),
           });
-          agentTaskMap.set(agentId, next.id);
-          store.update(next.id, { owner: agentId, metadata: { ...next.metadata, agentId } });
+          agentTaskMap.set(agentId, { taskId: next.id, executionId });
+          store.update(next.id, { owner: agentId, metadata: { agentId } });
           widget.setActiveTask(next.id);
         } catch (err: any) {
           store.update(next.id, { status: "pending", metadata: { ...next.metadata, lastError: err.message } });
@@ -241,15 +256,15 @@ export default function (pi: ExtensionAPI) {
   // Intentional stop (status === "stopped") → mark completed, preserve partial result
   pi.events.on("subagents:failed", (data) => {
     const { id, error, result, status } = data as { id: string; error?: string; result?: string; status: string };
-    const taskId = agentTaskMap.get(id);
-    if (!taskId) return;
+    const execution = findTaskForAgent(id);
+    if (!execution) return;
     agentTaskMap.delete(id);
-    const task = store.get(taskId);
+    const task = store.get(execution.taskId);
     if (!task) return;
 
     if (status === "stopped") {
       // Intentional stop — mark completed, preserve partial result
-      store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: result || task.metadata?.result } });
+      store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: result || task.metadata?.result, completedAt: Date.now() } });
       autoClear.trackCompletion(task.id, currentTurn);
     } else {
       // Actual error — revert to pending
@@ -373,6 +388,7 @@ export default function (pi: ExtensionAPI) {
     lastTaskToolUseTurn = 0;
     reminderInjectedThisCycle = false;
     autoClear.reset();
+    widget.resetRuntimeState();
 
     // Memory mode has no file-backed store to switch — clear explicitly on /new
     if (!isResume && taskScope === "memory") {
@@ -702,6 +718,11 @@ Set up task dependencies:
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { taskId, ...fields } = params;
+      if (fields.status === "in_progress") {
+        fields.metadata = { ...fields.metadata, startedAt: Date.now() };
+      } else if (fields.status === "completed") {
+        fields.metadata = { ...fields.metadata, completedAt: Date.now() };
+      }
       const { task, changedFields, warnings } = store.update(taskId, fields);
 
       if (changedFields.length === 0 && !task) {
@@ -758,8 +779,8 @@ Set up task dependencies:
         let resolvedId = task_id;
         if (!store.get(resolvedId)) {
           // Check if this is an agent ID mapped to a task
-          for (const [agentId, taskId] of agentTaskMap) {
-            if (agentId === task_id || agentId.startsWith(task_id)) { resolvedId = taskId; break; }
+          for (const [agentId, execution] of agentTaskMap) {
+            if (agentId === task_id || agentId.startsWith(task_id)) { resolvedId = execution.taskId; break; }
           }
         }
         const task = store.get(resolvedId);
@@ -778,13 +799,13 @@ Set up task dependencies:
                 if ((d as any).id === task.metadata?.agentId) { unsubOk(); unsubFail(); cleanup(); }
               });
               // Re-check in case status changed between the outer check and listener registration
-              const current = store.get(task_id);
+              const current = store.get(resolvedId);
               if (current && current.status !== "in_progress") { unsubOk(); unsubFail(); cleanup(); }
               signal?.addEventListener("abort", () => { unsubOk(); unsubFail(); cleanup(); }, { once: true });
             });
           }
-          const updated = store.get(task_id) ?? task;
-          return textResult(`Task #${task_id} [${updated.status}] — subagent ${task.metadata.agentId}`);
+          const updated = store.get(resolvedId) ?? task;
+          return textResult(`Task #${resolvedId} [${updated.status}] — subagent ${task.metadata.agentId}`);
         }
         throw new Error(`No background process for task ${task_id}`);
       }
@@ -831,16 +852,16 @@ Set up task dependencies:
         // Support both task IDs and agent IDs
         let resolvedId = taskId;
         if (!store.get(resolvedId)) {
-          for (const [agentId, tId] of agentTaskMap) {
-            if (agentId === taskId || agentId.startsWith(taskId)) { resolvedId = tId; break; }
+          for (const [agentId, execution] of agentTaskMap) {
+            if (agentId === taskId || agentId.startsWith(taskId)) { resolvedId = execution.taskId; break; }
           }
         }
         const task = store.get(resolvedId);
         if (task?.metadata?.agentId && task.status === "in_progress") {
-          store.update(taskId, { status: "completed" });
-          autoClear.trackCompletion(taskId, currentTurn);
+          store.update(resolvedId, { status: "completed" });
+          autoClear.trackCompletion(resolvedId, currentTurn);
           await stopSubagent(task.metadata.agentId);
-          widget.setActiveTask(taskId, false);
+          widget.setActiveTask(resolvedId, false);
           widget.update();
           return textResult(`Task #${taskId} stopped successfully`);
         }
@@ -923,7 +944,8 @@ Set up task dependencies:
         }
 
         // Mark in_progress and spawn agent via RPC
-        store.update(taskId, { status: "in_progress" });
+        const executionId = randomUUID();
+        store.update(taskId, { status: "in_progress", metadata: { executionId, startedAt: Date.now() } });
         const prompt = buildTaskPrompt(task, params.additional_context);
         try {
           const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
@@ -932,8 +954,8 @@ Set up task dependencies:
             maxTurns: params.max_turns,
             ...(params.model ? { model: params.model } : {}),
           });
-          agentTaskMap.set(agentId, taskId);
-          store.update(taskId, { owner: agentId, metadata: { ...task.metadata, agentId } });
+          agentTaskMap.set(agentId, { taskId, executionId });
+          store.update(taskId, { owner: agentId, metadata: { agentId } });
           widget.setActiveTask(taskId);
           launched.push(`#${taskId} → agent ${agentId}`);
         } catch (err: any) {
@@ -1058,12 +1080,12 @@ Set up task dependencies:
         const action = await ui.select(title, actions);
 
         if (action === "▸ Start (in_progress)") {
-          store.update(taskId, { status: "in_progress" });
+          store.update(taskId, { status: "in_progress", metadata: { startedAt: Date.now() } });
           widget.setActiveTask(taskId);
           widget.update();
           return viewTasks();
         } else if (action === "✓ Complete") {
-          store.update(taskId, { status: "completed" });
+          store.update(taskId, { status: "completed", metadata: { completedAt: Date.now() } });
           autoClear.trackCompletion(taskId, currentTurn);
           widget.setActiveTask(taskId, false);
           widget.update();
