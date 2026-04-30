@@ -354,6 +354,30 @@ describe("Completion listener", () => {
     expect(output.content[0].text).toContain("final answer");
   });
 
+  it("injects queued completion notifications into the next task tool result", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Notify task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    mock.emitEvent("subagents:completed", { id: "agent-1", result: "done" });
+
+    const [result] = await mock.fireLifecycle("tool_result", {
+      toolName: "TaskOutput",
+      content: [{ type: "text", text: "original" }],
+    });
+    expect(result.content.map((c: any) => c.text).join("\n")).toContain("<task-notification>");
+    expect(result.content.map((c: any) => c.text).join("\n")).toContain("completed");
+
+    const [second] = await mock.fireLifecycle("tool_result", {
+      toolName: "TaskOutput",
+      content: [{ type: "text", text: "original" }],
+    });
+    expect(second.content?.map((c: any) => c.text).join("\n") ?? "").not.toContain("<task-notification>");
+  });
+
   it("injects queued completion notifications into the next non-task tool result", async () => {
     await mock.executeTool("TaskCreate", {
       subject: "Notify task",

@@ -386,16 +386,16 @@ export default function (pi: ExtensionAPI) {
   // Appends a <system-reminder> nudge to non-task tool results when tasks exist
   // but task tools haven't been used recently (mimics Claude Code's behavior).
   pi.on("tool_result", async (event) => {
-    // Task tool usage resets the reminder timer
-    if (TASK_TOOL_NAMES.has(event.toolName)) {
-      lastTaskToolUseTurn = currentTurn;
-      reminderInjectedThisCycle = false;
-      return {};
-    }
-
     const extraContent: Array<{ type: "text"; text: string }> = [];
     if (pendingTaskNotifications.length > 0) {
       extraContent.push({ type: "text", text: pendingTaskNotifications.splice(0).join("\n\n") });
+    }
+
+    // Task tool usage resets the reminder timer, but still drains queued task notifications.
+    if (TASK_TOOL_NAMES.has(event.toolName)) {
+      lastTaskToolUseTurn = currentTurn;
+      reminderInjectedThisCycle = false;
+      return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
     }
 
     // Cheap checks first — avoid store.list() disk I/O when possible
