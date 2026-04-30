@@ -14,6 +14,11 @@ const TASKS_DIR = join(homedir(), ".pi", "tasks");
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100; // 5s max
 
+/** Block briefly without burning CPU while waiting for a file lock. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /** Simple file-based locking. */
 function acquireLock(lockPath: string): void {
   for (let i = 0; i < LOCK_MAX_RETRIES; i++) {
@@ -31,9 +36,8 @@ function acquireLock(lockPath: string): void {
             continue;
           }
         } catch { /* ignore read errors */ }
-        // Wait and retry
-        const start = Date.now();
-        while (Date.now() - start < LOCK_RETRY_MS) { /* busy wait */ }
+        // Wait and retry without a CPU-burning spin loop.
+        sleepSync(LOCK_RETRY_MS);
         continue;
       }
       throw e;
@@ -53,9 +57,11 @@ function isProcessRunning(pid: number): boolean {
 export class TaskStore {
   private filePath: string | undefined;
   private lockPath: string | undefined;
+  private highWaterMarkPath: string | undefined;
 
   // In-memory state (always kept in sync)
   private nextId = 1;
+  private highWaterMark = 0;
   private tasks = new Map<string, Task>();
 
   constructor(listIdOrPath?: string) {
@@ -65,16 +71,25 @@ export class TaskStore {
     mkdirSync(dirname(filePath), { recursive: true });
     this.filePath = filePath;
     this.lockPath = filePath + ".lock";
+    this.highWaterMarkPath = filePath + ".highwatermark";
     this.load();
   }
 
   /** Read store from disk (file-backed mode only). */
   private load(): void {
     if (!this.filePath) return;
-    if (!existsSync(this.filePath)) return;
+
+    const diskHighWaterMark = this.readHighWaterMark();
+    if (!existsSync(this.filePath)) {
+      this.highWaterMark = Math.max(this.highWaterMark, diskHighWaterMark);
+      this.nextId = Math.max(this.nextId, this.highWaterMark + 1);
+      return;
+    }
     try {
       const data: TaskStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
-      this.nextId = data.nextId;
+      const highestTaskId = data.tasks.reduce((max, task) => Math.max(max, Number(task.id) || 0), 0);
+      this.highWaterMark = Math.max(diskHighWaterMark, data.highWaterMark ?? 0, highestTaskId, data.nextId - 1);
+      this.nextId = Math.max(data.nextId, this.highWaterMark + 1);
       this.tasks.clear();
       for (const t of data.tasks) {
         this.tasks.set(t.id, t);
@@ -82,16 +97,30 @@ export class TaskStore {
     } catch { /* corrupt file — start fresh */ }
   }
 
+  private readHighWaterMark(): number {
+    if (!this.highWaterMarkPath || !existsSync(this.highWaterMarkPath)) return 0;
+    const n = Number.parseInt(readFileSync(this.highWaterMarkPath, "utf-8"), 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  private writeHighWaterMark(): void {
+    if (!this.highWaterMarkPath) return;
+    writeFileSync(this.highWaterMarkPath, String(this.highWaterMark));
+  }
+
   /** Write store to disk atomically (file-backed mode only). */
   private save(): void {
     if (!this.filePath) return;
+    this.highWaterMark = Math.max(this.highWaterMark, this.nextId - 1);
     const data: TaskStoreData = {
       nextId: this.nextId,
+      highWaterMark: this.highWaterMark,
       tasks: Array.from(this.tasks.values()),
     };
     const tmpPath = this.filePath + ".tmp";
     writeFileSync(tmpPath, JSON.stringify(data, null, 2));
     renameSync(tmpPath, this.filePath);
+    this.writeHighWaterMark();
   }
 
   /** Execute a mutation with file locking (if file-backed). */
@@ -111,8 +140,11 @@ export class TaskStore {
   create(subject: string, description: string, activeForm?: string, metadata?: Record<string, any>): Task {
     return this.withLock(() => {
       const now = Date.now();
+      const id = Math.max(this.nextId, this.highWaterMark + 1);
+      this.nextId = id + 1;
+      this.highWaterMark = Math.max(this.highWaterMark, id);
       const task: Task = {
-        id: String(this.nextId++),
+        id: String(id),
         subject,
         description,
         status: "pending",

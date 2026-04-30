@@ -323,6 +323,7 @@ describe("TaskStore (file-backed)", () => {
     try { rmSync(filePath); } catch { /* */ }
     try { rmSync(filePath + ".lock"); } catch { /* */ }
     try { rmSync(filePath + ".tmp"); } catch { /* */ }
+    try { rmSync(filePath + ".highwatermark"); } catch { /* */ }
   });
 
   it("persists tasks to disk", () => {
@@ -384,6 +385,18 @@ describe("TaskStore (file-backed)", () => {
     const t3 = store2.create("Task 3", "Desc");
     expect(t3.id).toBe("3");
   });
+
+  it("does not reuse IDs after deleting an empty session file", () => {
+    const store1 = new TaskStore(testListId);
+    store1.create("Task 1", "Desc");
+    store1.create("Task 2", "Desc");
+    store1.clearAll();
+    expect(store1.deleteFileIfEmpty()).toBe(true);
+
+    const store2 = new TaskStore(testListId);
+    const t3 = store2.create("Task 3", "Desc");
+    expect(t3.id).toBe("3");
+  });
 });
 
 describe("TaskStore (absolute path)", () => {
@@ -393,6 +406,7 @@ describe("TaskStore (absolute path)", () => {
     try { rmSync(absFilePath); } catch { /* */ }
     try { rmSync(absFilePath + ".lock"); } catch { /* */ }
     try { rmSync(absFilePath + ".tmp"); } catch { /* */ }
+    try { rmSync(absFilePath + ".highwatermark"); } catch { /* */ }
   });
 
   it("accepts absolute path and persists tasks", () => {

@@ -21,6 +21,8 @@ export interface Task {
 /** Serialized store format on disk. */
 export interface TaskStoreData {
   nextId: number;
+  /** Highest numeric task ID ever assigned. Preserved across deletes/clears. */
+  highWaterMark?: number;
   tasks: Task[];
 }
 
