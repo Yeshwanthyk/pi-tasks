@@ -98,7 +98,20 @@ export default function (pi: ExtensionAPI) {
   // For project scope (or env override), create store immediately.
   // For session scope, start with in-memory and upgrade once we have the session ID.
   let store = new TaskStore(resolveStorePath());
-  const tracker = new ProcessTracker();
+
+  // ── Subagent/task execution state ──
+  /** Model-visible task notifications waiting to be appended to a tool result. */
+  const pendingTaskNotifications: string[] = [];
+  const enqueueTaskNotification = (msg: string) => {
+    if (!pendingTaskNotifications.includes(msg)) pendingTaskNotifications.push(msg);
+  };
+  const tracker = new ProcessTracker({
+    onStall: (taskId, tail) => enqueueTaskNotification(taskNotification(
+      taskId,
+      "stalled",
+      `Background task #${taskId} appears to be waiting for interactive input. Last output: ${tail.trimEnd()}`,
+    )),
+  });
   const widget = new TaskWidget(store);
 
   // ── Subagent integration state ──
@@ -108,11 +121,6 @@ export default function (pi: ExtensionAPI) {
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
   /** Maps agent IDs to their task execution for O(1), idempotent completion lookup. */
   const agentTaskMap = new Map<string, { taskId: string; executionId: string }>();
-  /** Model-visible task notifications waiting to be appended to a tool result. */
-  const pendingTaskNotifications: string[] = [];
-  const enqueueTaskNotification = (msg: string) => {
-    if (!pendingTaskNotifications.includes(msg)) pendingTaskNotifications.push(msg);
-  };
 
   // ── Subagent RPC helpers ──
 

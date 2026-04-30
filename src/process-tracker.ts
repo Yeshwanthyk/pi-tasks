@@ -48,9 +48,12 @@ export function looksLikePrompt(tail: string): boolean {
 export class ProcessTracker {
   private processes = new Map<string, BackgroundProcess>();
 
+  constructor(private defaultOptions: ProcessTrackerOptions = {}) {}
+
   /** Register a spawned process for a task. */
   track(taskId: string, proc: ChildProcess, command?: string, outputFileOrOptions?: string | ProcessTrackerOptions): void {
-    const options = typeof outputFileOrOptions === "string" ? { outputFile: outputFileOrOptions } : outputFileOrOptions;
+    const callOptions = typeof outputFileOrOptions === "string" ? { outputFile: outputFileOrOptions } : outputFileOrOptions;
+    const options = { ...this.defaultOptions, ...callOptions };
     const outputFile = options?.outputFile;
     if (outputFile) {
       mkdirSync(dirname(outputFile), { recursive: true });

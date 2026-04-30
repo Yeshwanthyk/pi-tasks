@@ -71,6 +71,22 @@ describe("ProcessTracker", () => {
     expect(tail).toContain("Continue?");
   });
 
+  it("uses constructor default stall options", async () => {
+    let stalls = 0;
+    tracker = new ProcessTracker({
+      stallCheckIntervalMs: 10,
+      stallThresholdMs: 30,
+      onStall: () => { stalls++; },
+    });
+    const proc = spawn("sh", ["-c", "printf 'Overwrite?' && sleep 10"]);
+    tracker.track("1", proc);
+
+    await new Promise((r) => setTimeout(r, 120));
+    proc.kill("SIGKILL");
+
+    expect(stalls).toBe(1);
+  });
+
   it("classifies interactive prompt tails", () => {
     expect(looksLikePrompt("Downloading...\nContinue?")).toBe(true);
     expect(looksLikePrompt("Running tests...\nall quiet")).toBe(false);
