@@ -250,7 +250,7 @@ export default function (pi: ExtensionAPI) {
 
     const outputFile = writeTaskOutput(task.id, result);
     store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, outputFile, completedAt: Date.now() } });
-    enqueueTaskNotification(taskNotification(task.id, "completed", `Task \"${task.subject}\" completed`, outputFile));
+    enqueueTaskNotification(taskNotification(task.id, "completed", `Task "${task.subject}" completed`, outputFile));
     widget.setActiveTask(task.id, false);
 
     // Auto-cascade: find unblocked dependents with agentType
@@ -305,12 +305,12 @@ export default function (pi: ExtensionAPI) {
       const finalResult = result || task.metadata?.result;
       const outputFile = writeTaskOutput(task.id, finalResult);
       store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: finalResult, outputFile, completedAt: Date.now() } });
-      enqueueTaskNotification(taskNotification(task.id, "stopped", `Task \"${task.subject}\" was stopped`, outputFile));
+      enqueueTaskNotification(taskNotification(task.id, "stopped", `Task "${task.subject}" was stopped`, outputFile));
       autoClear.trackCompletion(task.id, currentTurn);
     } else {
       // Actual error — revert to pending
       store.update(task.id, { status: "pending", metadata: { ...task.metadata, lastError: error || status } });
-      enqueueTaskNotification(taskNotification(task.id, "failed", `Task \"${task.subject}\" failed: ${error || status}`));
+      enqueueTaskNotification(taskNotification(task.id, "failed", `Task "${task.subject}" failed: ${error || status}`));
       autoClear.resetBatchCountdown();
     }
     widget.setActiveTask(task.id, false);
