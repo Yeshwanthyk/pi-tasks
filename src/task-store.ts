@@ -348,9 +348,12 @@ export class TaskStore {
 
   /** Delete the backing file (if file-backed and empty). */
   deleteFileIfEmpty(): boolean {
-    if (!this.filePath || this.tasks.size > 0) return false;
-    try { unlinkSync(this.filePath); } catch { /* ignore */ }
-    return true;
+    if (!this.filePath) return false;
+    return this.withLock(() => {
+      if (this.tasks.size > 0) return false;
+      try { unlinkSync(this.filePath!); } catch { /* ignore */ }
+      return true;
+    });
   }
 
   /** Remove all completed tasks. */
