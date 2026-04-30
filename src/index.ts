@@ -57,6 +57,11 @@ function boundedOutput(content: unknown, maxChars = 50_000): string {
   return text.length > maxChars ? text.slice(0, maxChars) + "\n\n[... truncated]" : text;
 }
 
+function taskNotification(taskId: string, status: string, summary: string, outputFile?: string): string {
+  return `<task-notification>\n<task_id>${taskId}</task_id>\n<status>${status}</status>` +
+    `${outputFile ? `\n<output_file>${outputFile}</output_file>` : ""}\n<summary>${summary}</summary>\n</task-notification>`;
+}
+
 /** Task tool names — used to detect task tool usage for reminder suppression. */
 const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskOutput", "TaskStop", "TaskExecute"]);
 
@@ -103,6 +108,11 @@ export default function (pi: ExtensionAPI) {
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
   /** Maps agent IDs to their task execution for O(1), idempotent completion lookup. */
   const agentTaskMap = new Map<string, { taskId: string; executionId: string }>();
+  /** Model-visible task notifications waiting to be appended to a tool result. */
+  const pendingTaskNotifications: string[] = [];
+  const enqueueTaskNotification = (msg: string) => {
+    if (!pendingTaskNotifications.includes(msg)) pendingTaskNotifications.push(msg);
+  };
 
   // ── Subagent RPC helpers ──
 
@@ -240,6 +250,7 @@ export default function (pi: ExtensionAPI) {
 
     const outputFile = writeTaskOutput(task.id, result);
     store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, outputFile, completedAt: Date.now() } });
+    enqueueTaskNotification(taskNotification(task.id, "completed", `Task \"${task.subject}\" completed`, outputFile));
     widget.setActiveTask(task.id, false);
 
     // Auto-cascade: find unblocked dependents with agentType
@@ -294,10 +305,12 @@ export default function (pi: ExtensionAPI) {
       const finalResult = result || task.metadata?.result;
       const outputFile = writeTaskOutput(task.id, finalResult);
       store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: finalResult, outputFile, completedAt: Date.now() } });
+      enqueueTaskNotification(taskNotification(task.id, "stopped", `Task \"${task.subject}\" was stopped`, outputFile));
       autoClear.trackCompletion(task.id, currentTurn);
     } else {
       // Actual error — revert to pending
       store.update(task.id, { status: "pending", metadata: { ...task.metadata, lastError: error || status } });
+      enqueueTaskNotification(taskNotification(task.id, "failed", `Task \"${task.subject}\" failed: ${error || status}`));
       autoClear.resetBatchCountdown();
     }
     widget.setActiveTask(task.id, false);
@@ -372,19 +385,30 @@ export default function (pi: ExtensionAPI) {
       return {};
     }
 
+    const extraContent: Array<{ type: "text"; text: string }> = [];
+    if (pendingTaskNotifications.length > 0) {
+      extraContent.push({ type: "text", text: pendingTaskNotifications.splice(0).join("\n\n") });
+    }
+
     // Cheap checks first — avoid store.list() disk I/O when possible
-    if (currentTurn - lastTaskToolUseTurn < REMINDER_INTERVAL) return {};
-    if (reminderInjectedThisCycle) return {};
+    if (currentTurn - lastTaskToolUseTurn < REMINDER_INTERVAL) {
+      return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
+    }
+    if (reminderInjectedThisCycle) {
+      return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
+    }
 
     const tasks = store.list();
-    if (tasks.length === 0) return {};
+    if (tasks.length === 0) {
+      return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
+    }
 
     // Append system-reminder to tool result content.
     // Reset the baseline so the next reminder fires REMINDER_INTERVAL turns later.
     reminderInjectedThisCycle = true;
     lastTaskToolUseTurn = currentTurn;
     return {
-      content: [...event.content, { type: "text" as const, text: SYSTEM_REMINDER }],
+      content: [...event.content, ...extraContent, { type: "text" as const, text: SYSTEM_REMINDER }],
     };
   });
 

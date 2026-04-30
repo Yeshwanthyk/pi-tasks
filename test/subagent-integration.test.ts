@@ -67,9 +67,11 @@ function mockPi() {
     },
     /** Fire lifecycle event handlers (turn_start, tool_result, etc.) */
     async fireLifecycle(event: string, ...args: any[]) {
+      const results = [];
       for (const h of lifecycleHandlers.get(event) ?? []) {
-        await h(...args);
+        results.push(await h(...args));
       }
+      return results;
     },
     /** Emit an event on pi.events (simulates subagent extension). */
     emitEvent(channel: string, data: unknown) {
@@ -350,6 +352,30 @@ describe("Completion listener", () => {
     const output = await mock.executeTool("TaskOutput", { task_id: "1", block: false, timeout: 0 });
     expect(output.content[0].text).toContain("Output file:");
     expect(output.content[0].text).toContain("final answer");
+  });
+
+  it("injects queued completion notifications into the next non-task tool result", async () => {
+    await mock.executeTool("TaskCreate", {
+      subject: "Notify task",
+      description: "Desc",
+      agentType: "general-purpose",
+    });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    mock.emitEvent("subagents:completed", { id: "agent-1", result: "done" });
+
+    const [result] = await mock.fireLifecycle("tool_result", {
+      toolName: "read",
+      content: [{ type: "text", text: "original" }],
+    });
+    expect(result.content.map((c: any) => c.text).join("\n")).toContain("<task-notification>");
+    expect(result.content.map((c: any) => c.text).join("\n")).toContain("completed");
+
+    const [second] = await mock.fireLifecycle("tool_result", {
+      toolName: "read",
+      content: [{ type: "text", text: "original" }],
+    });
+    expect(second.content?.map((c: any) => c.text).join("\n") ?? "").not.toContain("<task-notification>");
   });
 
   it("reverts task to pending on subagents:failed event", async () => {
