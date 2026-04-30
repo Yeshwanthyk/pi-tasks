@@ -6,6 +6,8 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import type { BackgroundProcess } from "./types.js";
 
 export interface ProcessOutput {
@@ -15,17 +17,23 @@ export interface ProcessOutput {
   startedAt: number;
   completedAt?: number;
   command?: string;
+  outputFile?: string;
 }
 
 export class ProcessTracker {
   private processes = new Map<string, BackgroundProcess>();
 
   /** Register a spawned process for a task. */
-  track(taskId: string, proc: ChildProcess, command?: string): void {
+  track(taskId: string, proc: ChildProcess, command?: string, outputFile?: string): void {
+    if (outputFile) {
+      mkdirSync(dirname(outputFile), { recursive: true });
+      writeFileSync(outputFile, "");
+    }
     const bp: BackgroundProcess = {
       taskId,
       pid: proc.pid!,
       command,
+      outputFile,
       output: [],
       status: "running",
       startedAt: Date.now(),
@@ -35,14 +43,16 @@ export class ProcessTracker {
     };
 
     // Buffer stdout
-    proc.stdout?.on("data", (data: Buffer) => {
-      bp.output.push(data.toString());
-    });
+    const recordOutput = (data: Buffer) => {
+      const text = data.toString();
+      bp.output.push(text);
+      if (bp.outputFile) appendFileSync(bp.outputFile, text);
+    };
+
+    proc.stdout?.on("data", recordOutput);
 
     // Buffer stderr
-    proc.stderr?.on("data", (data: Buffer) => {
-      bp.output.push(data.toString());
-    });
+    proc.stderr?.on("data", recordOutput);
 
     // Handle process exit
     proc.on("close", (code, _signal) => {
@@ -59,7 +69,9 @@ export class ProcessTracker {
     proc.on("error", (err) => {
       if (bp.status === "running") {
         bp.status = "error";
-        bp.output.push(`Process error: ${err.message}`);
+        const text = `Process error: ${err.message}`;
+        bp.output.push(text);
+        if (bp.outputFile) appendFileSync(bp.outputFile, text);
         bp.completedAt = Date.now();
         for (const resolve of bp.waiters) resolve();
         bp.waiters = [];
@@ -80,6 +92,7 @@ export class ProcessTracker {
       startedAt: bp.startedAt,
       completedAt: bp.completedAt,
       command: bp.command,
+      outputFile: bp.outputFile,
     };
   }
 

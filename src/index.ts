@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
@@ -37,6 +38,23 @@ function debug(...args: unknown[]) {
 
 function textResult(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], details: undefined as any };
+}
+
+function taskOutputPath(taskId: string): string {
+  return join(process.cwd(), ".pi", "tasks", "output", `task-${taskId}.txt`);
+}
+
+function writeTaskOutput(taskId: string, content: string | undefined): string | undefined {
+  if (content === undefined) return undefined;
+  const path = taskOutputPath(taskId);
+  mkdirSync(join(process.cwd(), ".pi", "tasks", "output"), { recursive: true });
+  writeFileSync(path, content);
+  return path;
+}
+
+function boundedOutput(content: unknown, maxChars = 50_000): string {
+  const text = typeof content === "string" ? content : "";
+  return text.length > maxChars ? text.slice(0, maxChars) + "\n\n[... truncated]" : text;
 }
 
 /** Task tool names — used to detect task tool usage for reminder suppression. */
@@ -220,7 +238,8 @@ export default function (pi: ExtensionAPI) {
     const task = store.get(execution.taskId);
     if (!task) return;
 
-    store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, completedAt: Date.now() } });
+    const outputFile = writeTaskOutput(task.id, result);
+    store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, outputFile, completedAt: Date.now() } });
     widget.setActiveTask(task.id, false);
 
     // Auto-cascade: find unblocked dependents with agentType
@@ -272,7 +291,9 @@ export default function (pi: ExtensionAPI) {
 
     if (status === "stopped") {
       // Intentional stop — mark completed, preserve partial result
-      store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: result || task.metadata?.result, completedAt: Date.now() } });
+      const finalResult = result || task.metadata?.result;
+      const outputFile = writeTaskOutput(task.id, finalResult);
+      store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: finalResult, outputFile, completedAt: Date.now() } });
       autoClear.trackCompletion(task.id, currentTurn);
     } else {
       // Actual error — revert to pending
@@ -851,7 +872,10 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
             });
           }
           const updated = store.get(resolvedId) ?? task;
-          return textResult(`Task #${resolvedId} [${updated.status}] — subagent ${task.metadata.agentId}`);
+          const result = boundedOutput(updated.metadata?.result);
+          const outputFile = updated.metadata?.outputFile ? `\nOutput file: ${updated.metadata.outputFile}` : "";
+          const body = result ? `\n\n${result}` : "";
+          return textResult(`Task #${resolvedId} [${updated.status}] — subagent ${task.metadata.agentId}${outputFile}${body}`);
         }
         throw new Error(`No background process for task ${task_id}`);
       }
@@ -860,13 +884,15 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         const result = await tracker.waitForCompletion(task_id, timeout ?? 30000, signal ?? undefined);
         if (result) {
           return textResult(
-            `Task #${task_id} (${result.status})${result.exitCode !== undefined ? ` exit code: ${result.exitCode}` : ""}\n\n${result.output}`,
+            `Task #${task_id} (${result.status})${result.exitCode !== undefined ? ` exit code: ${result.exitCode}` : ""}` +
+            `${result.outputFile ? `\nOutput file: ${result.outputFile}` : ""}\n\n${boundedOutput(result.output)}`,
           );
         }
       }
 
       return textResult(
-        `Task #${task_id} (${processOutput.status})${processOutput.exitCode !== undefined ? ` exit code: ${processOutput.exitCode}` : ""}\n\n${processOutput.output}`,
+        `Task #${task_id} (${processOutput.status})${processOutput.exitCode !== undefined ? ` exit code: ${processOutput.exitCode}` : ""}` +
+        `${processOutput.outputFile ? `\nOutput file: ${processOutput.outputFile}` : ""}\n\n${boundedOutput(processOutput.output)}`,
       );
     },
   });

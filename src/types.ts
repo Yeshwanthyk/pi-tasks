@@ -31,6 +31,7 @@ export interface BackgroundProcess {
   taskId: string;
   pid: number;
   command?: string;
+  outputFile?: string;
   output: string[];
   status: "running" | "completed" | "error" | "stopped";
   exitCode?: number;

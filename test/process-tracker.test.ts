@@ -1,12 +1,21 @@
 import { spawn } from "node:child_process";
-import { beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ProcessTracker } from "../src/process-tracker.js";
 
 describe("ProcessTracker", () => {
   let tracker: ProcessTracker;
+  let tmp: string;
 
   beforeEach(() => {
     tracker = new ProcessTracker();
+    tmp = mkdtempSync(join(tmpdir(), "pi-tasks-process-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   it("returns undefined for untracked task", () => {
@@ -30,6 +39,19 @@ describe("ProcessTracker", () => {
     expect(out!.command).toBe("echo hello world");
     expect(out!.startedAt).toBeGreaterThan(0);
     expect(out!.completedAt).toBeGreaterThan(0);
+  });
+
+  it("persists output to a file when outputFile is provided", async () => {
+    const outputFile = join(tmp, "task.log");
+    const proc = spawn("echo", ["persisted output"]);
+    tracker.track("1", proc, "echo persisted output", outputFile);
+
+    await new Promise<void>((r) => proc.on("close", r));
+    await new Promise((r) => setTimeout(r, 50));
+
+    const out = tracker.getOutput("1")!;
+    expect(out.outputFile).toBe(outputFile);
+    expect(readFileSync(outputFile, "utf-8")).toContain("persisted output");
   });
 
   it("tracks a process and captures stderr", async () => {

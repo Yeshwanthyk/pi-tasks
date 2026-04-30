@@ -3,6 +3,8 @@
  * auto-cascade, and widget agent ID display.
  */
 
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import initExtension from "../src/index.js";
 import { TaskStore } from "../src/task-store.js";
@@ -11,7 +13,10 @@ import { TaskWidget, type Theme, type UICtx } from "../src/ui/task-widget.js";
 // Force in-memory task store for all integration tests — prevents file-backed
 // store from loading stale tasks across test instances.
 beforeEach(() => { process.env.PI_TASKS = "off"; });
-afterEach(() => { delete process.env.PI_TASKS; });
+afterEach(() => {
+  delete process.env.PI_TASKS;
+  rmSync(join(process.cwd(), ".pi", "tasks", "output"), { recursive: true, force: true });
+});
 
 // ---- Mock pi ----
 
@@ -336,10 +341,15 @@ describe("Completion listener", () => {
     await mock.executeTool("TaskExecute", { task_ids: ["1"] });
 
     // Simulate agent completion
-    mock.emitEvent("subagents:completed", { id: "agent-1" });
+    mock.emitEvent("subagents:completed", { id: "agent-1", result: "final answer" });
 
     const result = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(result.content[0].text).toContain("Status: completed");
+    expect(result.content[0].text).toContain("outputFile");
+
+    const output = await mock.executeTool("TaskOutput", { task_id: "1", block: false, timeout: 0 });
+    expect(output.content[0].text).toContain("Output file:");
+    expect(output.content[0].text).toContain("final answer");
   });
 
   it("reverts task to pending on subagents:failed event", async () => {
