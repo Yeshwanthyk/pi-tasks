@@ -551,7 +551,7 @@ describe("Standalone operation (no subagents extension)", () => {
   });
 
   it("all core task tools are registered", () => {
-    for (const name of ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskExecute"]) {
+    for (const name of ["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskExecute"]) {
       expect(mock.tools.has(name)).toBe(true);
     }
   });
@@ -584,6 +584,15 @@ describe("Standalone operation (no subagents extension)", () => {
     await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
     const result = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(result.content[0].text).toContain("in_progress");
+  });
+
+  it("TaskClaim works without subagents", async () => {
+    await mock.executeTool("TaskCreate", { subject: "Claim me", description: "desc" });
+    const result = await mock.executeTool("TaskClaim", { taskId: "1", owner: "agent-a" });
+    expect(result.content[0].text).toContain("Claimed task #1");
+
+    const task = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(task.content[0].text).toContain("Owner: agent-a");
   });
 
   it("TaskExecute gracefully refuses without subagents", async () => {

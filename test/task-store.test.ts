@@ -289,6 +289,54 @@ describe("TaskStore (in-memory)", () => {
     expect(store.clearCompleted()).toBe(0);
   });
 
+  it("atomically claims an available task", () => {
+    store.create("Claim me", "Desc");
+
+    const result = store.claim("1", "agent-a");
+
+    expect(result.success).toBe(true);
+    expect(store.get("1")!.owner).toBe("agent-a");
+  });
+
+  it("does not claim a task owned by someone else", () => {
+    store.create("Claimed", "Desc");
+    store.claim("1", "agent-a");
+
+    const result = store.claim("1", "agent-b");
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.reason).toBe("already_claimed");
+    expect(store.get("1")!.owner).toBe("agent-a");
+  });
+
+  it("does not claim a blocked task", () => {
+    store.create("Blocker", "Desc");
+    store.create("Blocked", "Desc");
+    store.update("2", { addBlockedBy: ["1"] });
+
+    const result = store.claim("2", "agent-a");
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.reason).toBe("blocked");
+      expect(result.blockedBy).toEqual(["1"]);
+    }
+  });
+
+  it("does not claim another task when owner is busy", () => {
+    store.create("First", "Desc");
+    store.create("Second", "Desc");
+    store.claim("1", "agent-a");
+
+    const result = store.claim("2", "agent-a", { checkOwnerBusy: true });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.reason).toBe("owner_busy");
+      expect(result.busyWith).toEqual(["1"]);
+    }
+  });
+
   it("list sorts pending → in_progress → completed with all three present", () => {
     store.create("Pending task", "Desc");
     store.create("Completed task", "Desc");

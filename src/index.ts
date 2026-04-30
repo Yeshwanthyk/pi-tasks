@@ -6,6 +6,7 @@
  *   TaskList     — List all tasks with status
  *   TaskGet      — Get full task details
  *   TaskUpdate   — Update task fields, status, dependencies
+ *   TaskClaim    — Atomically claim an available task
  *   TaskOutput   — Get output from a background task process
  *   TaskStop     — Stop a running background task process
  *   TaskExecute  — Execute tasks as subagents (requires @tintinweb/pi-subagents)
@@ -39,7 +40,7 @@ function textResult(msg: string) {
 }
 
 /** Task tool names — used to detect task tool usage for reminder suppression. */
-const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskOutput", "TaskStop", "TaskExecute"]);
+const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskOutput", "TaskStop", "TaskExecute"]);
 
 /** How many turns without task tool usage before injecting a reminder. */
 const REMINDER_INTERVAL = 4;
@@ -757,7 +758,45 @@ Set up task dependencies:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 5: TaskOutput
+  // Tool 5: TaskClaim
+  // ──────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "TaskClaim",
+    label: "TaskClaim",
+    description: `Atomically claim an available task for an owner.
+
+Use this instead of TaskUpdate(owner) when multiple agents or sessions may coordinate through a shared task list. The claim succeeds only when the task exists, is not completed, is not blocked by open dependencies, and is not already owned by someone else.
+
+If checkOwnerBusy is true, the claim also fails when the owner already has another non-completed task.`,
+    parameters: Type.Object({
+      taskId: Type.String({ description: "The ID of the task to claim" }),
+      owner: Type.String({ description: "Owner/agent name or ID claiming the task" }),
+      checkOwnerBusy: Type.Optional(Type.Boolean({ description: "Fail if owner already owns another non-completed task", default: false })),
+    }),
+
+    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const result = store.claim(params.taskId, params.owner, { checkOwnerBusy: params.checkOwnerBusy });
+      if (!result.success) {
+        switch (result.reason) {
+          case "task_not_found": return Promise.resolve(textResult(`Task #${params.taskId} not found`));
+          case "already_completed": return Promise.resolve(textResult(`Task #${params.taskId} is already completed`));
+          case "already_claimed": return Promise.resolve(textResult(`Task #${params.taskId} is already claimed by ${result.task?.owner}`));
+          case "blocked": return Promise.resolve(textResult(`Task #${params.taskId} is blocked by ${result.blockedBy?.map(id => "#" + id).join(", ")}`));
+          case "owner_busy": return Promise.resolve(textResult(`${params.owner} is already busy with ${result.busyWith?.map(id => "#" + id).join(", ")}`));
+        }
+      }
+      widget.update();
+      return Promise.resolve(textResult(
+        result.changedFields.length > 0
+          ? `Claimed task #${params.taskId} for ${params.owner}`
+          : `Task #${params.taskId} already claimed by ${params.owner}`,
+      ));
+    },
+  });
+
+  // ──────────────────────────────────────────────────
+  // Tool 6: TaskOutput
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -833,7 +872,7 @@ Set up task dependencies:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 6: TaskStop
+  // Tool 7: TaskStop
   // ──────────────────────────────────────────────────
 
   pi.registerTool({
@@ -884,7 +923,7 @@ Set up task dependencies:
   });
 
   // ──────────────────────────────────────────────────
-  // Tool 7: TaskExecute
+  // Tool 8: TaskExecute
   // ──────────────────────────────────────────────────
 
   pi.registerTool({

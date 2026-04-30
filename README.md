@@ -12,7 +12,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 ## Features
 
-- **7 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskOutput`, `TaskStop`, `TaskExecute` — matching Claude Code's exact tool specs and descriptions
+- **8 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskClaim`, `TaskOutput`, `TaskStop`, `TaskExecute` — matching Claude Code's task workflow plus Pi-specific atomic claiming
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts
 - **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
@@ -125,6 +125,18 @@ Update task fields, status, metadata, and dependencies.
 Setting `status: "deleted"` permanently removes the task.
 
 Dependencies are bidirectional: `addBlocks: ["3"]` on task 1 also adds `blockedBy: ["1"]` to task 3.
+
+### `TaskClaim`
+
+Atomically claim an available task for an owner. Prefer this over `TaskUpdate(owner)` when multiple agents/sessions share a task list.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `taskId` | string | Task ID (required) |
+| `owner` | string | Owner/agent name or ID claiming the task (required) |
+| `checkOwnerBusy` | boolean | If true, fail when the owner already has another non-completed task |
+
+Failure reasons are explicit: task not found, already completed, already claimed, blocked, or owner busy.
 
 ### `TaskOutput`
 
@@ -300,7 +312,7 @@ If [`pi-subagents`](https://github.com/tintinweb/pi-subagents) is not installed,
 
 ```
 src/
-├── index.ts            # Extension entry: 7 tools + /tasks command + widget + subagent integration
+├── index.ts            # Extension entry: 8 tools + /tasks command + widget + subagent integration
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)

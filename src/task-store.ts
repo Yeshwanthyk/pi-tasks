@@ -10,6 +10,16 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type { Task, TaskStatus, TaskStoreData } from "./types.js";
 
+export type ClaimTaskResult =
+  | { success: true; task: Task; changedFields: string[] }
+  | {
+      success: false;
+      reason: "task_not_found" | "already_claimed" | "already_completed" | "blocked" | "owner_busy";
+      task?: Task;
+      blockedBy?: string[];
+      busyWith?: string[];
+    };
+
 const TASKS_DIR = join(homedir(), ".pi", "tasks");
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100; // 5s max
@@ -280,6 +290,36 @@ export class TaskStore {
 
       task.updatedAt = Date.now();
       return { task, changedFields, warnings };
+    });
+  }
+
+  /** Atomically claim a task for an owner if it is available. */
+  claim(id: string, owner: string, opts: { checkOwnerBusy?: boolean } = {}): ClaimTaskResult {
+    return this.withLock(() => {
+      const task = this.tasks.get(id);
+      if (!task) return { success: false, reason: "task_not_found" };
+      if (task.status === "completed") return { success: false, reason: "already_completed", task };
+      if (task.owner && task.owner !== owner) return { success: false, reason: "already_claimed", task };
+
+      const openBlockers = task.blockedBy.filter(blockerId => {
+        const blocker = this.tasks.get(blockerId);
+        return !blocker || blocker.status !== "completed";
+      });
+      if (openBlockers.length > 0) {
+        return { success: false, reason: "blocked", task, blockedBy: openBlockers };
+      }
+
+      if (opts.checkOwnerBusy) {
+        const busyWith = Array.from(this.tasks.values())
+          .filter(t => t.id !== id && t.owner === owner && t.status !== "completed")
+          .map(t => t.id);
+        if (busyWith.length > 0) return { success: false, reason: "owner_busy", task, busyWith };
+      }
+
+      if (task.owner === owner) return { success: true, task, changedFields: [] };
+      task.owner = owner;
+      task.updatedAt = Date.now();
+      return { success: true, task, changedFields: ["owner"] };
     });
   }
 
