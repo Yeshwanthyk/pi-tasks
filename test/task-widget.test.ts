@@ -212,6 +212,31 @@ describe("TaskWidget", () => {
     expect(lines[11]).toContain("5 more");
   });
 
+  it("prioritizes active and recently completed tasks when truncated", () => {
+    widget.update();
+    renderWidget(ui.state);
+
+    for (let i = 0; i < 12; i++) {
+      store.create(`Old done ${i + 1}`, "Desc");
+      store.update(String(i + 1), { status: "completed" });
+    }
+    widget.update();
+    renderWidget(ui.state);
+
+    vi.advanceTimersByTime(31_000);
+    store.create("Running priority", "Desc", "Doing priority"); // #13
+    store.update("13", { status: "in_progress" });
+    widget.setActiveTask("13", true);
+    store.create("Recent done", "Desc"); // #14
+    store.update("14", { status: "completed" });
+    widget.update();
+
+    const lines = renderWidget(ui.state);
+    expect(lines.some(l => l.includes("Doing priority…"))).toBe(true);
+    expect(lines.some(l => l.includes("Recent done"))).toBe(true);
+    expect(lines.some(l => l.includes("Old done 12"))).toBe(false);
+  });
+
   it("tracks token usage for active tasks", () => {
     store.create("Active task", "Desc", "Running");
     store.update("1", { status: "in_progress" });

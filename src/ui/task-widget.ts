@@ -33,6 +33,7 @@ const SPINNER = ["✳", "✴", "✵", "✶", "✷", "✸", "✹", "✺", "✻", 
 
 const MAX_VISIBLE_TASKS = 10;
 const MANUAL_TASK_STALE_AFTER_MS = 10 * 60 * 1000;
+const RECENT_COMPLETED_TTL_MS = 30 * 1000;
 
 /** Per-task runtime metrics (elapsed time, token usage). */
 export interface TaskMetrics {
@@ -69,6 +70,12 @@ export class TaskWidget {
   private activeTaskIds = new Set<string>();
   /** Per-task runtime metrics keyed by task ID. */
   private metrics = new Map<string, TaskMetrics>();
+  /** Completion transition timestamps, used to keep just-finished tasks visible briefly. */
+  private completionTimestamps = new Map<string, number>();
+  /** Completed task IDs seen on the previous update/render. */
+  private previousCompletedIds = new Set<string>();
+  /** Avoid treating already-completed persisted tasks as newly completed. */
+  private observedCompletionSnapshot = false;
   /** Cached TUI instance for requestRender() calls. */
   private tui: any | undefined;
   /** Whether the widget callback is currently registered. */
@@ -85,6 +92,9 @@ export class TaskWidget {
   resetRuntimeState() {
     this.activeTaskIds.clear();
     this.metrics.clear();
+    this.completionTimestamps.clear();
+    this.previousCompletedIds.clear();
+    this.observedCompletionSnapshot = false;
     if (this.widgetInterval) {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
@@ -128,9 +138,56 @@ export class TaskWidget {
     }
   }
 
+  /** Track task transitions into completed for relevance ordering. */
+  private observeCompletionTransitions(tasks: Array<{ id: string; status: string }>) {
+    const completedIds = new Set(tasks.filter(t => t.status === "completed").map(t => t.id));
+    const now = Date.now();
+
+    if (!this.observedCompletionSnapshot) {
+      this.previousCompletedIds = completedIds;
+      this.observedCompletionSnapshot = true;
+      return;
+    }
+
+    for (const id of completedIds) {
+      if (!this.previousCompletedIds.has(id) && !this.completionTimestamps.has(id)) {
+        this.completionTimestamps.set(id, now);
+      }
+    }
+    for (const id of this.completionTimestamps.keys()) {
+      if (!completedIds.has(id)) this.completionTimestamps.delete(id);
+    }
+    this.previousCompletedIds = completedIds;
+  }
+
+  /** Relevance ordering for the constrained widget view. */
+  private visibleTasks(tasks: ReturnType<TaskStore["list"]>) {
+    if (tasks.length <= MAX_VISIBLE_TASKS) return tasks;
+
+    const now = Date.now();
+    const byId = (a: (typeof tasks)[number], b: (typeof tasks)[number]) => Number(a.id) - Number(b.id);
+    const isRecentlyCompleted = (id: string) => {
+      const ts = this.completionTimestamps.get(id);
+      return ts !== undefined && now - ts < RECENT_COMPLETED_TTL_MS;
+    };
+    const hasOpenBlockers = (task: (typeof tasks)[number]) => task.blockedBy.some(id => {
+      const blocker = this.store.get(id);
+      return blocker && blocker.status !== "completed";
+    });
+
+    const recentCompleted = tasks.filter(t => t.status === "completed" && isRecentlyCompleted(t.id)).sort(byId);
+    const inProgress = tasks.filter(t => t.status === "in_progress").sort(byId);
+    const pendingUnblocked = tasks.filter(t => t.status === "pending" && !hasOpenBlockers(t)).sort(byId);
+    const pendingBlocked = tasks.filter(t => t.status === "pending" && hasOpenBlockers(t)).sort(byId);
+    const olderCompleted = tasks.filter(t => t.status === "completed" && !isRecentlyCompleted(t.id)).sort(byId);
+
+    return [...recentCompleted, ...inProgress, ...pendingUnblocked, ...pendingBlocked, ...olderCompleted].slice(0, MAX_VISIBLE_TASKS);
+  }
+
   /** Build widget lines from current live state. Called from the render callback. */
   private renderWidget(tui: any, theme: Theme): string[] {
     const tasks = this.store.list();
+    this.observeCompletionTransitions(tasks);
     const w = tui.terminal.columns;
     const truncate = (line: string) => truncateToWidth(line, w);
 
@@ -149,7 +206,7 @@ export class TaskWidget {
     const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
     const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
 
-    const visible = tasks.slice(0, MAX_VISIBLE_TASKS);
+    const visible = this.visibleTasks(tasks);
     for (let i = 0; i < visible.length; i++) {
       const task = visible[i];
       const metric = this.metrics.get(task.id);
@@ -223,6 +280,7 @@ export class TaskWidget {
   update() {
     if (!this.uiCtx) return;
     const tasks = this.store.list();
+    this.observeCompletionTransitions(tasks);
 
     // Transition: visible → hidden
     if (tasks.length === 0) {
