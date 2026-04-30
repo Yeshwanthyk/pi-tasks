@@ -40,4 +40,5 @@ export interface BackgroundProcess {
   proc: import("node:child_process").ChildProcess;
   abortController: AbortController;
   waiters: Array<() => void>;
+  watchdogTimer?: ReturnType<typeof setInterval>;
 }

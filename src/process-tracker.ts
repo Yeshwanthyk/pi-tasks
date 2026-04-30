@@ -10,6 +10,13 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { BackgroundProcess } from "./types.js";
 
+export interface ProcessTrackerOptions {
+  outputFile?: string;
+  stallCheckIntervalMs?: number;
+  stallThresholdMs?: number;
+  onStall?: (taskId: string, tail: string) => void;
+}
+
 export interface ProcessOutput {
   output: string;
   status: BackgroundProcess["status"];
@@ -20,11 +27,31 @@ export interface ProcessOutput {
   outputFile?: string;
 }
 
+const DEFAULT_STALL_CHECK_INTERVAL_MS = 5_000;
+const DEFAULT_STALL_THRESHOLD_MS = 45_000;
+const STALL_TAIL_CHARS = 1024;
+const PROMPT_PATTERNS = [
+  /\(y\/n\)/i,
+  /\[y\/n\]/i,
+  /\(yes\/no\)/i,
+  /\b(?:Do you|Would you|Shall I|Are you sure|Ready to)\b.*\? *$/i,
+  /Press (any key|Enter)/i,
+  /Continue\?/i,
+  /Overwrite\?/i,
+];
+
+export function looksLikePrompt(tail: string): boolean {
+  const lastLine = tail.trimEnd().split("\n").pop() ?? "";
+  return PROMPT_PATTERNS.some(p => p.test(lastLine));
+}
+
 export class ProcessTracker {
   private processes = new Map<string, BackgroundProcess>();
 
   /** Register a spawned process for a task. */
-  track(taskId: string, proc: ChildProcess, command?: string, outputFile?: string): void {
+  track(taskId: string, proc: ChildProcess, command?: string, outputFileOrOptions?: string | ProcessTrackerOptions): void {
+    const options = typeof outputFileOrOptions === "string" ? { outputFile: outputFileOrOptions } : outputFileOrOptions;
+    const outputFile = options?.outputFile;
     if (outputFile) {
       mkdirSync(dirname(outputFile), { recursive: true });
       writeFileSync(outputFile, "");
@@ -42,9 +69,13 @@ export class ProcessTracker {
       waiters: [],
     };
 
+    let lastOutputAt = Date.now();
+    let stallNotified = false;
+
     // Buffer stdout
     const recordOutput = (data: Buffer) => {
       const text = data.toString();
+      lastOutputAt = Date.now();
       bp.output.push(text);
       if (bp.outputFile) appendFileSync(bp.outputFile, text);
     };
@@ -54,8 +85,24 @@ export class ProcessTracker {
     // Buffer stderr
     proc.stderr?.on("data", recordOutput);
 
+    if (options?.onStall) {
+      const checkInterval = options.stallCheckIntervalMs ?? DEFAULT_STALL_CHECK_INTERVAL_MS;
+      const threshold = options.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
+      bp.watchdogTimer = setInterval(() => {
+        if (bp.status !== "running" || stallNotified) return;
+        if (Date.now() - lastOutputAt < threshold) return;
+        const tail = bp.output.join("").slice(-STALL_TAIL_CHARS);
+        if (!looksLikePrompt(tail)) return;
+        stallNotified = true;
+        if (bp.watchdogTimer) clearInterval(bp.watchdogTimer);
+        options.onStall?.(taskId, tail);
+      }, checkInterval);
+      bp.watchdogTimer.unref?.();
+    }
+
     // Handle process exit
     proc.on("close", (code, _signal) => {
+      if (bp.watchdogTimer) clearInterval(bp.watchdogTimer);
       if (bp.status === "running") {
         bp.status = code === 0 ? "completed" : "error";
       }
@@ -67,6 +114,7 @@ export class ProcessTracker {
     });
 
     proc.on("error", (err) => {
+      if (bp.watchdogTimer) clearInterval(bp.watchdogTimer);
       if (bp.status === "running") {
         bp.status = "error";
         const text = `Process error: ${err.message}`;
@@ -125,6 +173,7 @@ export class ProcessTracker {
     if (!bp || bp.status !== "running") return false;
 
     bp.status = "stopped";
+    if (bp.watchdogTimer) clearInterval(bp.watchdogTimer);
     bp.proc.kill("SIGTERM");
 
     // Wait up to 5s for graceful exit

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ProcessTracker } from "../src/process-tracker.js";
+import { looksLikePrompt, ProcessTracker } from "../src/process-tracker.js";
 
 describe("ProcessTracker", () => {
   let tracker: ProcessTracker;
@@ -52,6 +52,28 @@ describe("ProcessTracker", () => {
     const out = tracker.getOutput("1")!;
     expect(out.outputFile).toBe(outputFile);
     expect(readFileSync(outputFile, "utf-8")).toContain("persisted output");
+  });
+
+  it("detects prompt-like stalled output once", async () => {
+    const proc = spawn("sh", ["-c", "printf 'Continue?' && sleep 10"]);
+    let stalls = 0;
+    let tail = "";
+    tracker.track("1", proc, "prompt", {
+      stallCheckIntervalMs: 10,
+      stallThresholdMs: 30,
+      onStall: (_taskId, stalledTail) => { stalls++; tail = stalledTail; },
+    });
+
+    await new Promise((r) => setTimeout(r, 120));
+    proc.kill("SIGKILL");
+
+    expect(stalls).toBe(1);
+    expect(tail).toContain("Continue?");
+  });
+
+  it("classifies interactive prompt tails", () => {
+    expect(looksLikePrompt("Downloading...\nContinue?")).toBe(true);
+    expect(looksLikePrompt("Running tests...\nall quiet")).toBe(false);
   });
 
   it("tracks a process and captures stderr", async () => {
