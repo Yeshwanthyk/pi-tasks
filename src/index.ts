@@ -9,7 +9,7 @@
  *   TaskClaim    — Atomically claim an available task
  *   TaskOutput   — Get output from a background task process
  *   TaskStop     — Stop a running background task process
- *   TaskExecute  — Execute tasks as subagents (requires @tintinweb/pi-subagents)
+ *   TaskExecute  — Execute tasks as subagents (requires pi-interactive-subagents)
  *
  * Commands:
  *   /tasks       — Interactive task management menu
@@ -151,14 +151,14 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  /** Spawn a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
+  /** Spawn a subagent via pi.events RPC (requires pi-interactive-subagents extension). */
   function spawnSubagent(type: string, prompt: string, options?: any): Promise<string> {
     debug("spawn:call", { type, options: { ...options, prompt: undefined } });
     return rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000)
       .then(d => { debug("spawn:ok", d); return d.id; });
   }
 
-  /** Stop a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
+  /** Stop a subagent via pi.events RPC (requires pi-interactive-subagents extension). */
   function stopSubagent(agentId: string): Promise<void> {
     return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
   }
@@ -192,14 +192,14 @@ export default function (pi: ExtensionAPI) {
       const remoteVersion = (raw as any)?.data?.version as number | undefined;
       if (remoteVersion === undefined) {
         pendingWarning =
-          "@tintinweb/pi-subagents is outdated — please update for task execution support.";
+          "pi-interactive-subagents is outdated — please update for task execution support.";
       } else if (remoteVersion > PROTOCOL_VERSION) {
         pendingWarning =
           `@tintinweb/pi-tasks is outdated (protocol v${PROTOCOL_VERSION}, ` +
-          `pi-subagents has v${remoteVersion}) — please update for task execution support.`;
+          `pi-interactive-subagents has v${remoteVersion}) — please update for task execution support.`;
       } else if (remoteVersion < PROTOCOL_VERSION) {
         pendingWarning =
-          `@tintinweb/pi-subagents is outdated (protocol v${remoteVersion}, ` +
+          `pi-interactive-subagents is outdated (protocol v${remoteVersion}, ` +
           `pi-tasks has v${PROTOCOL_VERSION}) — please update for task execution support.`;
       } else {
         subagentsAvailable = true;
@@ -1015,7 +1015,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
       if (!subagentsAvailable) {
         return textResult(
           "Subagent execution is currently unavailable. " +
-          "Ensure the @tintinweb/pi-subagents extension is loaded and try again."
+          "Ensure the pi-interactive-subagents extension is loaded and try again."
         );
       }
 

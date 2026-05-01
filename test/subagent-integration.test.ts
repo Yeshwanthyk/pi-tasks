@@ -95,7 +95,7 @@ function mockCtx() {
 
 // ---- Mock subagents extension (RPC responders) ----
 
-/** Simulates the @tintinweb/pi-subagents extension: responds to ping + spawn RPCs and emits ready. */
+/** Simulates the pi-interactive-subagents extension: responds to ping + spawn RPCs and emits ready. */
 function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?: string; onSpawnRequest?: () => void }) {
   let idCounter = 0;
   const spawned: Array<{ id: string; type: string; prompt: string; options: any }> = [];
@@ -939,7 +939,7 @@ describe("Protocol version mismatch", () => {
     expect(ctx.ui.notify).not.toHaveBeenCalled();
   });
 
-  it("old handler (no version) — warns about pi-subagents", async () => {
+  it("old handler (no version) — warns about pi-interactive-subagents", async () => {
     const mock = mockPi();
     installVersionedMock(mock.pi);  // no version = v1
     initExtension(mock.pi as any);
@@ -947,7 +947,7 @@ describe("Protocol version mismatch", () => {
     const ctx = mockCtx();
     await mock.fireLifecycle("before_agent_start", {}, ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("pi-subagents is outdated"),
+      expect.stringContaining("pi-interactive-subagents is outdated"),
       "warning",
     );
   });
@@ -965,7 +965,7 @@ describe("Protocol version mismatch", () => {
     );
   });
 
-  it("handler behind (v1) — warns about pi-subagents", async () => {
+  it("handler behind (v1) — warns about pi-interactive-subagents", async () => {
     const mock = mockPi();
     installVersionedMock(mock.pi, 1);
     initExtension(mock.pi as any);
@@ -973,7 +973,7 @@ describe("Protocol version mismatch", () => {
     const ctx = mockCtx();
     await mock.fireLifecycle("before_agent_start", {}, ctx);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("pi-subagents is outdated"),
+      expect.stringContaining("pi-interactive-subagents is outdated"),
       "warning",
     );
   });
