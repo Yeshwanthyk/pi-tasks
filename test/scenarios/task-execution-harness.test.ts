@@ -53,6 +53,13 @@ describe("PiTasksHarness scenarios", () => {
       status: "pending",
       execution: { status: "failed", agentId: "agent-1", error: "boom" },
     });
+
+    await h.tool("TaskExecute", { task_ids: ["1"] });
+    expect(h.spawned(1)).toMatchObject({ id: "agent-2", type: "general-purpose" });
+    await h.expectTask("1", {
+      status: "in_progress",
+      execution: { status: "running", agentId: "agent-2" },
+    });
     await h.expectInvariants();
   });
 
@@ -86,7 +93,13 @@ describe("PiTasksHarness scenarios", () => {
 
     await h.expectTask("1", {
       status: "completed",
-      execution: { status: "stopping", agentId: "agent-1" },
+      execution: { status: "stopped", agentId: "agent-1" },
+    });
+
+    await h.subagentStopped("agent-1", "partial");
+    await h.expectTask("1", {
+      status: "completed",
+      execution: { status: "stopped", agentId: "agent-1", result: "partial" },
     });
     await h.expectInvariants();
   });
@@ -100,6 +113,6 @@ describe("PiTasksHarness scenarios", () => {
 
     const lines = h.renderWidget();
     expect(lines.join("\n")).toContain("Visible");
-    expect(lines.join("\n")).toContain("agent agent");
+    expect(lines.join("\n")).toContain("Visible (agent agent)…");
   });
 });

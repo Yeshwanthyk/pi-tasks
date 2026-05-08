@@ -63,7 +63,7 @@ export class TaskExecution {
         const dep = this.deps.getStore().get(depId);
         const result = dep?.execution && (dep.execution.status === "completed" || dep.execution.status === "stopped")
           ? dep.execution.result
-          : undefined;
+          : typeof dep?.metadata?.result === "string" ? dep.metadata.result : undefined;
         if (dep && result) {
           const body = result.length > PREREQUISITE_RESULT_LIMIT
             ? result.slice(0, PREREQUISITE_RESULT_LIMIT) + "\n\n[... truncated — use TaskGet for full output]"
@@ -128,9 +128,10 @@ export class TaskExecution {
     if (openBlockers.length > 0) return { success: false, reason: `blocked by ${openBlockers.map(id => "#" + id).join(", ")}` };
 
     const executionId = randomUUID();
+    const startedAt = Date.now();
     this.deps.getStore().update(task.id, {
       status: "in_progress",
-      execution: { status: "running", executionId, agentId: null, startedAt: Date.now() },
+      execution: { status: "running", executionId, agentId: null, startedAt },
     });
 
     try {
@@ -144,7 +145,7 @@ export class TaskExecution {
       this.agentTaskMap.set(agentId, { taskId: task.id, executionId });
       this.deps.getStore().update(task.id, {
         owner: agentId,
-        execution: { status: "running", executionId, agentId, startedAt: Date.now() },
+        execution: { status: "running", executionId, agentId, startedAt },
       });
       this.deps.onTaskActivated(task.id, true);
       return { success: true, agentId };
@@ -207,6 +208,7 @@ export class TaskExecution {
     const executionId = task.execution?.executionId ?? randomUUID();
 
     if (data.status === "stopped") {
+      const wasAlreadyStopped = task.execution?.status === "stopped";
       const finalResult = data.result || (task.execution && (task.execution.status === "completed" || task.execution.status === "stopped") ? task.execution.result : undefined);
       const outputFile = this.deps.writeOutput(task.id, finalResult);
       this.deps.getStore().update(task.id, {
@@ -221,7 +223,7 @@ export class TaskExecution {
         },
       });
       this.deps.notify(this.deps.taskNotification(task.id, "stopped", `Task "${task.subject}" was stopped`, outputFile));
-      this.deps.onTaskCompleted(task.id);
+      if (!wasAlreadyStopped) this.deps.onTaskCompleted(task.id);
     } else {
       this.deps.getStore().update(task.id, {
         status: "pending",
@@ -248,6 +250,12 @@ export class TaskExecution {
           resolvedId = execution.taskId;
           break;
         }
+      }
+      if (!this.deps.getStore().get(resolvedId)) {
+        const task = this.deps.getStore().list().find(t =>
+          t.execution?.agentId && (t.execution.agentId === taskOrAgentId || t.execution.agentId.startsWith(taskOrAgentId))
+        );
+        if (task) resolvedId = task.id;
       }
     }
     let task = this.deps.getStore().get(resolvedId);
@@ -305,10 +313,10 @@ export class TaskExecution {
     this.deps.getStore().update(resolvedId, {
       status: "completed",
       execution: {
-        status: "stopping",
+        status: "stopped",
         executionId,
         agentId,
-        stopRequestedAt: Date.now(),
+        stoppedAt: Date.now(),
       },
     });
     this.deps.onTaskCompleted(resolvedId);

@@ -25,6 +25,7 @@ import { ProcessTracker } from "./process-tracker.js";
 import { TaskExecution } from "./task-execution.js";
 import { TaskStore } from "./task-store.js";
 import { loadTasksConfig } from "./tasks-config.js";
+import type { TaskExecutionState } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
 
@@ -56,6 +57,13 @@ function writeTaskOutput(taskId: string, content: string | undefined): string | 
 function boundedOutput(content: unknown, maxChars = 50_000): string {
   const text = typeof content === "string" ? content : "";
   return text.length > maxChars ? text.slice(0, maxChars) + "\n\n[... truncated]" : text;
+}
+
+function formatExecution(execution: TaskExecutionState): string {
+  if ((execution.status === "completed" || execution.status === "stopped") && execution.result) {
+    return JSON.stringify({ ...execution, result: boundedOutput(execution.result, 4000) });
+  }
+  return JSON.stringify(execution);
 }
 
 function taskNotification(taskId: string, status: string, summary: string, outputFile?: string): string {
@@ -345,15 +353,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Session replacement flows emit session_start on the newly-bound extension
-  // runtime. Older pi versions used session_switch; current pi uses
-  // session_start with reason "new" | "resume" | "fork".
-  pi.on("session_start", async (event, ctx) => {
+  function resetSessionRuntime(reason: string | undefined, ctx: ExtensionContext, opts?: { startupResume?: boolean }) {
     widget.setUICtx(ctx.ui as UICtx);
-
-    const isReplacement = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
-    const isStartupResume = event.reason === "startup" && ctx.sessionManager.getEntries().some(e => e.type === "message");
-    if (!isReplacement && !isStartupResume) return;
 
     storeUpgraded = false;
     persistedTasksShown = false;
@@ -364,12 +365,28 @@ export default function (pi: ExtensionAPI) {
     widget.resetRuntimeState();
 
     // Memory mode has no file-backed store to switch — clear explicitly on /new
-    if (event.reason === "new" && taskScope === "memory") {
+    if (reason === "new" && taskScope === "memory") {
       store.clearAll();
     }
 
     upgradeStoreIfNeeded(ctx);
-    showPersistedTasks(event.reason === "resume" || isStartupResume);
+    showPersistedTasks(reason === "resume" || opts?.startupResume === true);
+  }
+
+  // Current pi emits session_start; older versions emitted session_switch.
+  pi.on("session_start", async (event, ctx) => {
+    const reason = event.reason as string | undefined;
+    const isReplacement = reason === "new" || reason === "resume" || reason === "fork";
+    const isStartupResume = reason === "startup" && ctx.sessionManager.getEntries().some(e => e.type === "message");
+    if (!isReplacement && !isStartupResume) {
+      widget.setUICtx(ctx.ui as UICtx);
+      return;
+    }
+    resetSessionRuntime(reason, ctx, { startupResume: isStartupResume });
+  });
+
+  (pi.on as (event: string, handler: (event: { reason?: string }, ctx: ExtensionContext) => Promise<void>) => void)("session_switch", async (event, ctx) => {
+    resetSessionRuntime(event.reason, ctx);
   });
 
   // Keep latestCtx fresh on every tool execution as well.
@@ -577,7 +594,7 @@ Returns full task details:
       }
 
       if (task.agentType) lines.push(`Agent type: ${task.agentType}`);
-      if (task.execution) lines.push(`Execution: ${JSON.stringify(task.execution)}`);
+      if (task.execution) lines.push(`Execution: ${formatExecution(task.execution)}`);
 
       // Show metadata if non-empty
       const metaKeys = Object.keys(task.metadata);

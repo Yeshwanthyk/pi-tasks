@@ -52,11 +52,16 @@ function createUiMock(): { ctx: UICtx & { notify: ReturnType<typeof vi.fn> }; st
 }
 
 function mockTheme(): Theme {
-  return {
+  const identity = (text: string) => text;
+  return new Proxy({
     fg: (_color: string, text: string) => text,
-    bold: (text: string) => text,
+    bold: identity,
     strikethrough: (text: string) => `~~${text}~~`,
-  };
+  }, {
+    get(target, prop: keyof Theme) {
+      return target[prop] ?? identity;
+    },
+  }) as Theme;
 }
 
 function createMockPi() {
@@ -193,17 +198,18 @@ export class PiTasksHarness {
 
   async subagentCompleted(agentId: string, result?: string): Promise<void> {
     this.emit("subagents:completed", { id: agentId, result });
-    await Promise.resolve();
+    await this.flushEvents();
   }
 
   async subagentFailed(agentId: string, error: string): Promise<void> {
     this.emit("subagents:failed", { id: agentId, status: "failed", error });
-    await Promise.resolve();
+    await this.flushEvents();
   }
 
+  /** The subagents extension reports intentional stops on its failed lifecycle channel. */
   async subagentStopped(agentId: string, result?: string): Promise<void> {
     this.emit("subagents:failed", { id: agentId, status: "stopped", result });
-    await Promise.resolve();
+    await this.flushEvents();
   }
 
   spawned(index = 0): SpawnedSubagent {
@@ -241,6 +247,10 @@ export class PiTasksHarness {
     if (expected.execution) expect(task.execution).toMatchObject(expected.execution);
   }
 
+  async flushEvents(): Promise<void> {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
   async expectInvariants(): Promise<void> {
     const list = await this.tool("TaskList", {}) as { content: Array<{ text: string }> };
     const ids = [...(list.content[0]?.text ?? "").matchAll(/^#(\d+) /gm)].map(m => m[1]);
@@ -251,9 +261,9 @@ export class PiTasksHarness {
       if (execution.status === "running") expect(task.status).toBe("in_progress");
       if (execution.status === "completed" || execution.status === "stopped" || execution.status === "stopping") expect(task.status).toBe("completed");
       if (execution.status === "failed") expect(task.status).toBe("pending");
-      expect(task.metadata.agentId).toBeUndefined();
-      expect(task.metadata.agentType).toBeUndefined();
-      expect(task.metadata.executionId).toBeUndefined();
+      expect(task.metadata).not.toHaveProperty("agentId");
+      expect(task.metadata).not.toHaveProperty("agentType");
+      expect(task.metadata).not.toHaveProperty("executionId");
     }
   }
 
