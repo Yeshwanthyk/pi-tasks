@@ -4,6 +4,13 @@
 
 export type TaskStatus = "pending" | "in_progress" | "completed";
 
+export type TaskExecutionState =
+  | { status: "running"; executionId: string; agentId: string | null; startedAt: number }
+  | { status: "completed"; executionId: string; agentId: string; completedAt: number; result?: string; outputFile?: string }
+  | { status: "failed"; executionId: string; agentId: string | null; failedAt: number; error: string }
+  | { status: "stopping"; executionId: string; agentId: string; stopRequestedAt: number }
+  | { status: "stopped"; executionId: string; agentId: string; stoppedAt: number; result?: string; outputFile?: string };
+
 export interface Task {
   id: string;
   subject: string;
@@ -11,7 +18,9 @@ export interface Task {
   status: TaskStatus;
   activeForm?: string;
   owner?: string;
-  metadata: Record<string, any>;
+  agentType?: string;
+  execution?: TaskExecutionState;
+  metadata: Record<string, unknown>;
   blocks: string[];
   blockedBy: string[];
   createdAt: number;

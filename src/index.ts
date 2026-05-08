@@ -22,6 +22,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import { Type } from "typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { TaskExecution } from "./task-execution.js";
 import { TaskStore } from "./task-store.js";
 import { loadTasksConfig } from "./tasks-config.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
@@ -115,12 +116,8 @@ export default function (pi: ExtensionAPI) {
   const widget = new TaskWidget(store);
 
   // ── Subagent integration state ──
-  /** Latest ExtensionContext — refreshed on every tool execution so cascade always has a valid one. */
-  let latestCtx: ExtensionContext | undefined;
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
-  /** Maps agent IDs to their task execution for O(1), idempotent completion lookup. */
-  const agentTaskMap = new Map<string, { taskId: string; executionId: string }>();
 
   // ── Subagent RPC helpers ──
 
@@ -163,20 +160,21 @@ export default function (pi: ExtensionAPI) {
     return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
   }
 
-  /** Resolve a subagent lifecycle event to its current task execution, even after in-memory maps are lost. */
-  function findTaskForAgent(agentId: string, opts?: { allowCompleted?: boolean }): { taskId: string; executionId?: string } | undefined {
-    const mapped = agentTaskMap.get(agentId);
-    if (mapped) {
-      const task = store.get(mapped.taskId);
-      const statusMatches = task?.status === "in_progress" || (opts?.allowCompleted && task?.status === "completed");
-      if (statusMatches && task?.metadata?.executionId === mapped.executionId) return mapped;
-      return undefined;
-    }
-    const task = store.list().find(t =>
-      t.status === "in_progress" && t.metadata?.agentId === agentId
-    );
-    return task ? { taskId: task.id, executionId: task.metadata?.executionId } : undefined;
-  }
+  const taskExecution = new TaskExecution({
+    getStore: () => store,
+    spawnSubagent,
+    stopSubagent,
+    writeOutput: writeTaskOutput,
+    notify: enqueueTaskNotification,
+    taskNotification,
+    onTaskActivated: (taskId, active = true) => widget.setActiveTask(taskId, active),
+    onTasksChanged: () => widget.update(),
+    onTaskCompleted: taskId => autoClear.trackCompletion(taskId, currentTurn),
+    onCascadeBlocked: () => autoClear.resetBatchCountdown(),
+    isAutoCascadeEnabled: () => cfg.autoCascade ?? false,
+    getCascadeConfig: () => cascadeConfig,
+    subscribeSubagentEvent: (event, handler) => pi.events.on(event, handler),
+  });
 
   // ── Subagent extension presence & version detection ──
   const PROTOCOL_VERSION = 2;
@@ -211,118 +209,15 @@ export default function (pi: ExtensionAPI) {
   checkSubagentsVersion();
   pi.events.on("subagents:ready", () => checkSubagentsVersion());
 
-  /** Build a prompt for a task being executed by a subagent.
-   *  Injects completed dependency results so cascaded agents have context from prerequisites.
-   */
-  function buildTaskPrompt(
-    task: { id: string; subject: string; description: string; blockedBy?: string[] },
-    additionalContext?: string,
-  ): string {
-    let prompt = `You are executing task #${task.id}: "${task.subject}"\n\n${task.description}`;
-
-    // Inject completed dependency results so cascaded agents have full context
-    if (task.blockedBy && task.blockedBy.length > 0) {
-      const depResults: string[] = [];
-      for (const depId of task.blockedBy) {
-        const dep = store.get(depId);
-        if (dep?.metadata?.result) {
-          const result = dep.metadata.result.length > 4000
-            ? dep.metadata.result.slice(0, 4000) + "\n\n[... truncated — use TaskGet for full output]"
-            : dep.metadata.result;
-          depResults.push(`### Task #${depId}: ${dep.subject}\n${result}`);
-        }
-      }
-      if (depResults.length > 0) {
-        prompt += `\n\n## Prerequisite task results\n\n${depResults.join("\n\n")}`;
-      }
-    }
-
-    if (additionalContext) prompt += `\n\n${additionalContext}`;
-    prompt += `\n\nComplete this task fully. Do not attempt to manage tasks yourself.`;
-    return prompt;
-  }
-
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
 
   // ── Subagent completion listener ──
-  // Listens for subagent lifecycle events to update task status and optionally cascade.
-
-  // Success → mark task completed, cascade if enabled
   pi.events.on("subagents:completed", async (data) => {
-    const { id, result } = data as { id: string; result?: string };
-    const execution = findTaskForAgent(id);
-    if (!execution) return;
-    agentTaskMap.delete(id);
-    const task = store.get(execution.taskId);
-    if (!task) return;
-
-    const outputFile = writeTaskOutput(task.id, result);
-    store.update(task.id, { status: "completed", metadata: { ...task.metadata, result, outputFile, completedAt: Date.now() } });
-    enqueueTaskNotification(taskNotification(task.id, "completed", `Task "${task.subject}" completed`, outputFile));
-    widget.setActiveTask(task.id, false);
-
-    // Auto-cascade: find unblocked dependents with agentType
-    if ((cfg.autoCascade ?? false) && cascadeConfig && latestCtx) {
-      const unblocked = store.list().filter(t =>
-        t.status === "pending" &&
-        t.metadata?.agentType &&
-        t.blockedBy.includes(task.id) &&
-        t.blockedBy.every(depId => store.get(depId)?.status === "completed")
-      );
-      for (const next of unblocked) {
-        const executionId = randomUUID();
-        store.update(next.id, {
-          status: "in_progress",
-          metadata: { executionId, startedAt: Date.now(), agentId: null, completedAt: null, stopRequestedAt: null },
-        });
-        const prompt = buildTaskPrompt(next, cascadeConfig.additionalContext);
-        try {
-          const agentId = await spawnSubagent(next.metadata.agentType, prompt, {
-            description: next.subject,
-            isBackground: true,
-            maxTurns: cascadeConfig.maxTurns,
-            ...(cascadeConfig.model ? { model: cascadeConfig.model } : {}),
-          });
-          agentTaskMap.set(agentId, { taskId: next.id, executionId });
-          store.update(next.id, { owner: agentId, metadata: { agentId } });
-          widget.setActiveTask(next.id);
-        } catch (err: any) {
-          store.update(next.id, {
-            status: "pending",
-            metadata: { executionId: null, startedAt: null, agentId: null, lastError: err.message },
-          });
-        }
-      }
-    }
-    autoClear.trackCompletion(task.id, currentTurn);
-    widget.update();
+    await taskExecution.handleCompleted(data as { id: string; result?: string });
   });
 
-  // Failure → store error, revert to pending, don't cascade (branch stops)
-  // Intentional stop (status === "stopped") → mark completed, preserve partial result
   pi.events.on("subagents:failed", (data) => {
-    const { id, error, result, status } = data as { id: string; error?: string; result?: string; status: string };
-    const execution = findTaskForAgent(id, { allowCompleted: status === "stopped" });
-    if (!execution) return;
-    agentTaskMap.delete(id);
-    const task = store.get(execution.taskId);
-    if (!task) return;
-
-    if (status === "stopped") {
-      // Intentional stop — mark completed, preserve partial result
-      const finalResult = result || task.metadata?.result;
-      const outputFile = writeTaskOutput(task.id, finalResult);
-      store.update(task.id, { status: "completed", metadata: { ...task.metadata, result: finalResult, outputFile, completedAt: Date.now() } });
-      enqueueTaskNotification(taskNotification(task.id, "stopped", `Task "${task.subject}" was stopped`, outputFile));
-      autoClear.trackCompletion(task.id, currentTurn);
-    } else {
-      // Actual error — revert to pending
-      store.update(task.id, { status: "pending", metadata: { ...task.metadata, lastError: error || status } });
-      enqueueTaskNotification(taskNotification(task.id, "failed", `Task "${task.subject}" failed: ${error || status}`));
-      autoClear.resetBatchCountdown();
-    }
-    widget.setActiveTask(task.id, false);
-    widget.update();
+    taskExecution.handleFailed(data as { id: string; error?: string; result?: string; status: string });
   });
 
   // ── Session-scoped store upgrade ──
@@ -367,7 +262,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     currentTurn++;
-    latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     if (autoClear.onTurnStart(currentTurn)) widget.update();
@@ -380,6 +274,25 @@ export default function (pi: ExtensionAPI) {
     if (msg?.role === "assistant" && msg.usage) {
       widget.addTokenUsage(msg.usage.input ?? 0, msg.usage.output ?? 0);
     }
+  });
+
+  // A manually marked in-progress task means "this is the current work item".
+  // The spinner means "the current agent turn is actively working on it". If the
+  // agent ends without marking the task completed, keep the task in_progress but
+  // stop the active spinner so the UI doesn't imply work is still running.
+  pi.on("agent_end", async (_event, ctx) => {
+    widget.setUICtx(ctx.ui as UICtx);
+    upgradeStoreIfNeeded(ctx);
+    for (const task of store.list()) {
+      if (task.status === "in_progress" && !task.execution?.agentId) {
+        widget.setActiveTask(task.id, false);
+      }
+    }
+    widget.update();
+  });
+
+  pi.on("session_shutdown", async () => {
+    widget.dispose();
   });
 
   // ── System-reminder injection via tool_result event ──
@@ -423,7 +336,6 @@ export default function (pi: ExtensionAPI) {
   // Grab UI context early — before_agent_start fires before any tool calls,
   // so persisted tasks show up immediately on session start.
   pi.on("before_agent_start", async (_event, ctx) => {
-    latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     showPersistedTasks();
@@ -433,16 +345,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // session_switch fires on /new (reason: "new") and /resume (reason: "resume").
-  // On /new: reset all session-scoped state so the store switches to the new session file.
-  // On resume: reload persisted tasks from the existing session file.
-  pi.on("session_switch" as any, async (event: any, ctx: ExtensionContext) => {
-    latestCtx = ctx;
+  // Session replacement flows emit session_start on the newly-bound extension
+  // runtime. Older pi versions used session_switch; current pi uses
+  // session_start with reason "new" | "resume" | "fork".
+  pi.on("session_start", async (event, ctx) => {
     widget.setUICtx(ctx.ui as UICtx);
 
-    const isResume = event?.reason === "resume";
+    const isReplacement = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+    const isStartupResume = event.reason === "startup" && ctx.sessionManager.getEntries().some(e => e.type === "message");
+    if (!isReplacement && !isStartupResume) return;
 
-    // Reset session-scoped state for both /new and /resume
     storeUpgraded = false;
     persistedTasksShown = false;
     currentTurn = 0;
@@ -452,17 +364,16 @@ export default function (pi: ExtensionAPI) {
     widget.resetRuntimeState();
 
     // Memory mode has no file-backed store to switch — clear explicitly on /new
-    if (!isResume && taskScope === "memory") {
+    if (event.reason === "new" && taskScope === "memory") {
       store.clearAll();
     }
 
     upgradeStoreIfNeeded(ctx);
-    showPersistedTasks(isResume);
+    showPersistedTasks(event.reason === "resume" || isStartupResume);
   });
 
   // Keep latestCtx fresh on every tool execution as well.
   pi.on("tool_execution_start", async (_event, ctx) => {
-    latestCtx = ctx;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     widget.update();
@@ -532,8 +443,7 @@ All tasks are created with status \`pending\`.
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       autoClear.resetBatchCountdown();
       const meta = params.metadata ?? {};
-      if (params.agentType) meta.agentType = params.agentType;
-      const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined);
+      const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined, params.agentType);
       widget.update();
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
     },
@@ -666,6 +576,9 @@ Returns full task details:
         lines.push(`Blocks: ${task.blocks.map(id => "#" + id).join(", ")}`);
       }
 
+      if (task.agentType) lines.push(`Agent type: ${task.agentType}`);
+      if (task.execution) lines.push(`Execution: ${JSON.stringify(task.execution)}`);
+
       // Show metadata if non-empty
       const metaKeys = Object.keys(task.metadata);
       if (metaKeys.length > 0) {
@@ -779,11 +692,6 @@ Set up task dependencies:
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { taskId, ...fields } = params;
-      if (fields.status === "in_progress") {
-        fields.metadata = { ...fields.metadata, startedAt: Date.now() };
-      } else if (fields.status === "completed") {
-        fields.metadata = { ...fields.metadata, completedAt: Date.now() };
-      }
       const { task, changedFields, warnings } = store.update(taskId, fields);
 
       if (changedFields.length === 0 && !task) {
@@ -873,43 +781,14 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
       const processOutput = tracker.getOutput(task_id);
       if (!processOutput) {
-        // No shell process — check if this is a subagent task
-        // Support both task IDs and agent IDs (resolve agent ID → task ID)
-        let resolvedId = task_id;
-        if (!store.get(resolvedId)) {
-          // Check if this is an agent ID mapped to a task
-          for (const [agentId, execution] of agentTaskMap) {
-            if (agentId === task_id || agentId.startsWith(task_id)) { resolvedId = execution.taskId; break; }
-          }
+        const output = await taskExecution.output(task_id, block, timeout ?? 30000, signal ?? undefined);
+        if (!output) {
+          if (!store.get(task_id)) throw new Error(`No task found with ID ${task_id}`);
+          throw new Error(`No background process for task ${task_id}`);
         }
-        const task = store.get(resolvedId);
-        if (!task) throw new Error(`No task found with ID ${task_id}`);
-
-        if (task.metadata?.agentId) {
-          // Subagent task — wait for completion if blocking
-          if (block && task.status === "in_progress") {
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(() => { unsubOk(); unsubFail(); resolve(); }, timeout ?? 30000);
-              const cleanup = () => { clearTimeout(timer); resolve(); };
-              const unsubOk = pi.events.on("subagents:completed", (d: unknown) => {
-                if ((d as any).id === task.metadata?.agentId) { unsubOk(); unsubFail(); cleanup(); }
-              });
-              const unsubFail = pi.events.on("subagents:failed", (d: unknown) => {
-                if ((d as any).id === task.metadata?.agentId) { unsubOk(); unsubFail(); cleanup(); }
-              });
-              // Re-check in case status changed between the outer check and listener registration
-              const current = store.get(resolvedId);
-              if (current && current.status !== "in_progress") { unsubOk(); unsubFail(); cleanup(); }
-              signal?.addEventListener("abort", () => { unsubOk(); unsubFail(); cleanup(); }, { once: true });
-            });
-          }
-          const updated = store.get(resolvedId) ?? task;
-          const result = boundedOutput(updated.metadata?.result);
-          const outputFile = updated.metadata?.outputFile ? `\nOutput file: ${updated.metadata.outputFile}` : "";
-          const body = result ? `\n\n${result}` : "";
-          return textResult(`Task #${resolvedId} [${updated.status}] — subagent ${task.metadata.agentId}${outputFile}${body}`);
-        }
-        throw new Error(`No background process for task ${task_id}`);
+        const outputFile = output.outputFile ? `\nOutput file: ${output.outputFile}` : "";
+        const body = output.result ? `\n\n${output.result}` : "";
+        return textResult(`Task #${output.taskId} [${output.status}] — subagent ${output.agentId}${outputFile}${body}`);
       }
 
       if (block && processOutput.status === "running") {
@@ -952,23 +831,8 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
       const stopped = await tracker.stop(taskId);
       if (!stopped) {
-        // No shell process — check if this is a subagent task
-        // Support both task IDs and agent IDs
-        let resolvedId = taskId;
-        if (!store.get(resolvedId)) {
-          for (const [agentId, execution] of agentTaskMap) {
-            if (agentId === taskId || agentId.startsWith(taskId)) { resolvedId = execution.taskId; break; }
-          }
-        }
-        const task = store.get(resolvedId);
-        if (task?.metadata?.agentId && task.status === "in_progress") {
-          store.update(resolvedId, { status: "completed", metadata: { completedAt: Date.now(), stopRequestedAt: Date.now() } });
-          autoClear.trackCompletion(resolvedId, currentTurn);
-          await stopSubagent(task.metadata.agentId);
-          widget.setActiveTask(resolvedId, false);
-          widget.update();
-          return textResult(`Task #${taskId} stopped successfully`);
-        }
+        const subagentStopped = await taskExecution.stop(taskId);
+        if (subagentStopped.stopped) return textResult(`Task #${taskId} stopped successfully`);
         throw new Error(`No running background process for task ${taskId}`);
       }
 
@@ -1019,76 +883,22 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         );
       }
 
-      const results: string[] = [];
-      const launched: string[] = [];
-
-      for (const taskId of params.task_ids) {
-        const task = store.get(taskId);
-        if (!task) {
-          results.push(`#${taskId}: not found`);
-          continue;
-        }
-        if (task.status !== "pending") {
-          results.push(`#${taskId}: not pending (status: ${task.status})`);
-          continue;
-        }
-        if (!task.metadata?.agentType) {
-          results.push(`#${taskId}: no agentType set — create with agentType parameter or update metadata`);
-          continue;
-        }
-
-        // Check all blockers are completed
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = store.get(bid);
-          return !blocker || blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          results.push(`#${taskId}: blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
-          continue;
-        }
-
-        // Mark in_progress and spawn agent via RPC
-        const executionId = randomUUID();
-        store.update(taskId, {
-          status: "in_progress",
-          metadata: { executionId, startedAt: Date.now(), agentId: null, completedAt: null, stopRequestedAt: null },
-        });
-        const prompt = buildTaskPrompt(task, params.additional_context);
-        try {
-          const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
-            description: task.subject,
-            isBackground: true,
-            maxTurns: params.max_turns,
-            ...(params.model ? { model: params.model } : {}),
-          });
-          agentTaskMap.set(agentId, { taskId, executionId });
-          store.update(taskId, { owner: agentId, metadata: { agentId } });
-          widget.setActiveTask(taskId);
-          launched.push(`#${taskId} → agent ${agentId}`);
-        } catch (err: any) {
-          debug(`spawn:error task=#${taskId}`, err);
-          store.update(taskId, { status: "pending", metadata: { executionId: null, startedAt: null, agentId: null } });
-          results.push(`#${taskId}: spawn failed — ${err.message}`);
-        }
-      }
-
-      // Save cascade config for the completion listener
       cascadeConfig = {
         additionalContext: params.additional_context,
         model: params.model,
         maxTurns: params.max_turns,
       };
 
-      widget.update();
+      const summary = await taskExecution.executeTasks(params.task_ids, cascadeConfig);
 
       const lines: string[] = [];
-      if (launched.length > 0) {
+      if (summary.launched.length > 0) {
         lines.push(
-          `Launched ${launched.length} agent(s):\n${launched.join("\n")}\n` +
+          `Launched ${summary.launched.length} agent(s):\n${summary.launched.map(l => `#${l.taskId} → agent ${l.agentId}`).join("\n")}\n` +
           `Use TaskOutput to check progress. Do not spawn additional agents for these tasks.`
         );
       }
-      if (results.length > 0) lines.push(`Skipped:\n${results.join("\n")}`);
+      if (summary.skipped.length > 0) lines.push(`Skipped:\n${summary.skipped.map(s => `#${s.taskId}: ${s.reason}`).join("\n")}`);
       if (lines.length === 0) lines.push("No tasks to execute.");
 
       return textResult(lines.join("\n\n"));
@@ -1187,12 +997,12 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         const action = await ui.select(title, actions);
 
         if (action === "▸ Start (in_progress)") {
-          store.update(taskId, { status: "in_progress", metadata: { startedAt: Date.now() } });
+          store.update(taskId, { status: "in_progress" });
           widget.setActiveTask(taskId);
           widget.update();
           return viewTasks();
         } else if (action === "✓ Complete") {
-          store.update(taskId, { status: "completed", metadata: { completedAt: Date.now() } });
+          store.update(taskId, { status: "completed" });
           autoClear.trackCompletion(taskId, currentTurn);
           widget.setActiveTask(taskId, false);
           widget.update();

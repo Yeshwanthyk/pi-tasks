@@ -147,8 +147,9 @@ export class TaskStore {
     }
   }
 
-  create(subject: string, description: string, activeForm?: string, metadata?: Record<string, any>): Task {
+  create(subject: string, description: string, activeForm?: string, metadata?: Record<string, unknown>, agentType?: string): Task {
     return this.withLock(() => {
+      const normalizedAgentType = agentType ?? (typeof metadata?.agentType === "string" ? metadata.agentType : undefined);
       const now = Date.now();
       const id = Math.max(this.nextId, this.highWaterMark + 1);
       this.nextId = id + 1;
@@ -160,6 +161,7 @@ export class TaskStore {
         status: "pending",
         activeForm,
         owner: undefined,
+        agentType: normalizedAgentType,
         metadata: metadata ?? {},
         blocks: [],
         blockedBy: [],
@@ -188,7 +190,9 @@ export class TaskStore {
     description?: string;
     activeForm?: string;
     owner?: string;
-    metadata?: Record<string, any>;
+    agentType?: string;
+    execution?: Task["execution"];
+    metadata?: Record<string, unknown>;
     addBlocks?: string[];
     addBlockedBy?: string[];
   }): { task: Task | undefined; changedFields: string[]; warnings: string[] } {
@@ -229,6 +233,14 @@ export class TaskStore {
       if (fields.owner !== undefined) {
         task.owner = fields.owner;
         changedFields.push("owner");
+      }
+      if (fields.agentType !== undefined) {
+        task.agentType = fields.agentType;
+        changedFields.push("agentType");
+      }
+      if (fields.execution !== undefined) {
+        task.execution = fields.execution;
+        changedFields.push("execution");
       }
 
       // Metadata: shallow merge, null deletes keys
