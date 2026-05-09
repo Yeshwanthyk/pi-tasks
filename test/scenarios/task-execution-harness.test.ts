@@ -63,6 +63,49 @@ describe("PiTasksHarness scenarios", () => {
     await h.expectInvariants();
   });
 
+  it("keeps manual lifecycle updates consistent through the extension harness", async () => {
+    h = PiTasksHarness.create();
+
+    await h.tool("TaskCreate", { subject: "Manual task", description: "Track by hand" });
+    await h.tool("TaskUpdate", { taskId: "1", status: "in_progress" });
+    await h.expectTask("1", { status: "in_progress" });
+
+    await h.tool("TaskUpdate", { taskId: "1", status: "completed" });
+    await h.expectTask("1", { status: "completed" });
+    await h.expectInvariants();
+  });
+
+  it("keeps dangling blocker warnings out of read projections", async () => {
+    h = PiTasksHarness.create();
+
+    await h.tool("TaskCreate", { subject: "A", description: "Has a dangling blocker" });
+    const update = await h.tool("TaskUpdate", { taskId: "1", addBlockedBy: ["9999"] }) as { content: Array<{ text: string }> };
+    expect(update.content[0].text).toContain("#9999 does not exist");
+
+    const list = await h.tool("TaskList", {}) as { content: Array<{ text: string }> };
+    expect(list.content[0].text).not.toContain("blocked by #9999");
+
+    const get = await h.tool("TaskGet", { taskId: "1" }) as { content: Array<{ text: string }> };
+    expect(get.content[0].text).not.toContain("Blocked by: #9999");
+
+    await h.lifecycle("turn_start", {}, h.ctx());
+    expect(h.renderWidget().join("\n")).not.toContain("blocked by #9999");
+  });
+
+  it("reports unavailable subagent execution through the adapter-backed tool path", async () => {
+    h = PiTasksHarness.create({ subagents: "missing" });
+
+    await h.tool("TaskCreate", {
+      subject: "Needs agent",
+      description: "Should not start",
+      agentType: "general-purpose",
+    });
+
+    const execute = await h.tool("TaskExecute", { task_ids: ["1"] }) as { content: Array<{ text: string }> };
+    expect(execute.content[0].text).toContain("Subagent execution is currently unavailable");
+    await h.expectTask("1", { status: "pending", agentType: "general-purpose" });
+  });
+
   it("injects prerequisite results when executing an unblocked dependent task", async () => {
     h = PiTasksHarness.create();
 
