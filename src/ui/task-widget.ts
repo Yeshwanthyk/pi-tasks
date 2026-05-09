@@ -9,6 +9,7 @@
  */
 
 import { truncateToWidth } from "@mariozechner/pi-tui";
+import { executionAgentId, openExistingBlockers } from "../task-projections.js";
 import type { TaskStore } from "../task-store.js";
 
 // ---- Types ----
@@ -170,10 +171,7 @@ export class TaskWidget {
       const ts = this.completionTimestamps.get(id);
       return ts !== undefined && now - ts < RECENT_COMPLETED_TTL_MS;
     };
-    const hasOpenBlockers = (task: (typeof tasks)[number]) => task.blockedBy.some(id => {
-      const blocker = this.store.get(id);
-      return blocker && blocker.status !== "completed";
-    });
+    const hasOpenBlockers = (task: (typeof tasks)[number]) => openExistingBlockers(task, id => this.store.get(id)).length > 0;
 
     const recentCompleted = tasks.filter(t => t.status === "completed" && isRecentlyCompleted(t.id)).sort(byId);
     const inProgress = tasks.filter(t => t.status === "in_progress").sort(byId);
@@ -212,7 +210,7 @@ export class TaskWidget {
       const metric = this.metrics.get(task.id);
       const legacyStartedAt = typeof task.metadata?.startedAt === "number" ? task.metadata.startedAt : undefined;
       const startedAt = task.execution?.status === "running" ? task.execution.startedAt : legacyStartedAt ?? metric?.startedAt;
-      const agentId = task.execution?.agentId ?? (typeof task.metadata?.agentId === "string" ? task.metadata.agentId : undefined);
+      const agentId = executionAgentId(task);
       const isStaleManual = task.status === "in_progress" && !agentId &&
         typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
       const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress" && !isStaleManual;
@@ -230,19 +228,16 @@ export class TaskWidget {
 
       let suffix = "";
       if (task.status === "pending" && task.blockedBy.length > 0) {
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = this.store.get(bid);
-          return blocker && blocker.status !== "completed";
-        });
-        if (openBlockers.length > 0) {
-          suffix = theme.fg("dim", ` › blocked by ${openBlockers.map(id => "#" + id).join(", ")}`);
+        const blockers = openExistingBlockers(task, id => this.store.get(id));
+        if (blockers.length > 0) {
+          suffix = theme.fg("dim", ` › blocked by ${blockers.map(id => "#" + id).join(", ")}`);
         }
       }
 
       let text: string;
       if (isActive) {
         const form = task.activeForm || task.subject;
-        const agentId = task.execution?.agentId ?? (typeof task.metadata?.agentId === "string" ? task.metadata.agentId : undefined);
+        const agentId = executionAgentId(task);
         const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
         const m = metric;
         let stats = "";
@@ -259,7 +254,7 @@ export class TaskWidget {
       } else if (task.status === "completed") {
         text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
       } else {
-        const agentId = task.execution?.agentId ?? (typeof task.metadata?.agentId === "string" ? task.metadata.agentId : undefined);
+        const agentId = executionAgentId(task);
         const agentSuffix = task.status === "in_progress" && agentId
           ? theme.fg("dim", ` (agent ${agentId.slice(0, 5)})`)
           : "";
@@ -312,7 +307,7 @@ export class TaskWidget {
       const metric = this.metrics.get(t.id);
       const legacyStartedAt = typeof t.metadata?.startedAt === "number" ? t.metadata.startedAt : undefined;
       const startedAt = t.execution?.status === "running" ? t.execution.startedAt : legacyStartedAt ?? metric?.startedAt;
-      const agentId = t.execution?.agentId ?? (typeof t.metadata?.agentId === "string" ? t.metadata.agentId : undefined);
+      const agentId = executionAgentId(t);
       const isStaleManual = !agentId &&
         typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
       return this.activeTaskIds.has(t.id) && t.status === "in_progress" && !isStaleManual;

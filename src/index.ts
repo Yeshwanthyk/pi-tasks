@@ -15,17 +15,19 @@
  *   /tasks       — Interactive task management menu
  */
 
-import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { SubagentAdapter } from "./subagent-adapter.js";
 import { TaskExecution } from "./task-execution.js";
+import { TaskLifecycle } from "./task-lifecycle.js";
+import { boundedOutput, executionAgentId, openExistingBlockers } from "./task-projections.js";
 import { TaskStore } from "./task-store.js";
 import { loadTasksConfig } from "./tasks-config.js";
-import type { TaskExecutionState } from "./types.js";
+import type { Task, TaskExecutionState } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TaskWidget, type UICtx } from "./ui/task-widget.js";
 
@@ -52,11 +54,6 @@ function writeTaskOutput(taskId: string, content: string | undefined): string | 
   mkdirSync(join(process.cwd(), ".pi", "tasks", "output"), { recursive: true });
   writeFileSync(path, content);
   return path;
-}
-
-function boundedOutput(content: unknown, maxChars = 50_000): string {
-  const text = typeof content === "string" ? content : "";
-  return text.length > maxChars ? text.slice(0, maxChars) + "\n\n[... truncated]" : text;
 }
 
 function formatExecution(execution: TaskExecutionState): string {
@@ -107,6 +104,7 @@ export default function (pi: ExtensionAPI) {
   // For project scope (or env override), create store immediately.
   // For session scope, start with in-memory and upgrade once we have the session ID.
   let store = new TaskStore(resolveStorePath());
+  const openBlockersForTask = (task: Pick<Task, "blockedBy">): string[] => openExistingBlockers(task, id => store.get(id));
 
   // ── Subagent/task execution state ──
   /** Model-visible task notifications waiting to be appended to a tool result. */
@@ -127,51 +125,12 @@ export default function (pi: ExtensionAPI) {
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
 
-  // ── Subagent RPC helpers ──
-
-  /** RPC reply envelope — matches pi-mono's RpcResponse shape. */
-  type RpcReply<T = void> =
-    | { success: true; data?: T }
-    | { success: false; error: string };
-
-  /** Call a subagents RPC method: emit request, wait for scoped reply, unwrap envelope. */
-  function rpcCall<T>(channel: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
-    const requestId = randomUUID();
-    debug(`rpc:send ${channel}`, { requestId });
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        unsub();
-        debug(`rpc:timeout ${channel}`, { requestId });
-        reject(new Error(`${channel} timeout`));
-      }, timeoutMs);
-      const unsub = pi.events.on(`${channel}:reply:${requestId}`, (raw: unknown) => {
-        unsub(); clearTimeout(timer);
-        debug(`rpc:reply ${channel}`, { requestId, raw });
-        const reply = raw as RpcReply<T>;
-        if (reply.success) resolve(reply.data as T);
-        else reject(new Error(reply.error));
-      });
-      pi.events.emit(channel, { requestId, ...params });
-      debug(`rpc:emitted ${channel}`, { requestId });
-    });
-  }
-
-  /** Spawn a subagent via pi.events RPC (requires pi-interactive-subagents extension). */
-  function spawnSubagent(type: string, prompt: string, options?: any): Promise<string> {
-    debug("spawn:call", { type, options: { ...options, prompt: undefined } });
-    return rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000)
-      .then(d => { debug("spawn:ok", d); return d.id; });
-  }
-
-  /** Stop a subagent via pi.events RPC (requires pi-interactive-subagents extension). */
-  function stopSubagent(agentId: string): Promise<void> {
-    return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
-  }
+  const subagents = new SubagentAdapter(pi.events, { debug });
 
   const taskExecution = new TaskExecution({
     getStore: () => store,
-    spawnSubagent,
-    stopSubagent,
+    spawnSubagent: (type, prompt, options) => subagents.spawn(type, prompt, options),
+    stopSubagent: agentId => subagents.stop(agentId),
     writeOutput: writeTaskOutput,
     notify: enqueueTaskNotification,
     taskNotification,
@@ -181,50 +140,25 @@ export default function (pi: ExtensionAPI) {
     onCascadeBlocked: () => autoClear.resetBatchCountdown(),
     isAutoCascadeEnabled: () => cfg.autoCascade ?? false,
     getCascadeConfig: () => cascadeConfig,
-    subscribeSubagentEvent: (event, handler) => pi.events.on(event, handler),
+    subscribeSubagentEvent: (event, handler) => subagents.subscribe(event, handler),
   });
 
-  // ── Subagent extension presence & version detection ──
-  const PROTOCOL_VERSION = 2;
-  let subagentsAvailable = false;
-  let pendingWarning: string | undefined;
-
-  /** Ping subagents and check protocol version. Works with any handler version. */
-  function checkSubagentsVersion() {
-    const requestId = randomUUID();
-    const timer = setTimeout(() => { unsub(); }, 5_000);
-    const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (raw: unknown) => {
-      unsub(); clearTimeout(timer);
-      const remoteVersion = (raw as any)?.data?.version as number | undefined;
-      if (remoteVersion === undefined) {
-        pendingWarning =
-          "pi-interactive-subagents is outdated — please update for task execution support.";
-      } else if (remoteVersion > PROTOCOL_VERSION) {
-        pendingWarning =
-          `@tintinweb/pi-tasks is outdated (protocol v${PROTOCOL_VERSION}, ` +
-          `pi-interactive-subagents has v${remoteVersion}) — please update for task execution support.`;
-      } else if (remoteVersion < PROTOCOL_VERSION) {
-        pendingWarning =
-          `pi-interactive-subagents is outdated (protocol v${remoteVersion}, ` +
-          `pi-tasks has v${PROTOCOL_VERSION}) — please update for task execution support.`;
-      } else {
-        subagentsAvailable = true;
-      }
-    });
-    pi.events.emit("subagents:rpc:ping", { requestId });
-  }
-
-  checkSubagentsVersion();
-  pi.events.on("subagents:ready", () => checkSubagentsVersion());
-
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
+  const taskLifecycle = new TaskLifecycle({
+    getStore: () => store,
+    currentTurn: () => currentTurn,
+    onTaskActivated: (taskId, active = true) => widget.setActiveTask(taskId, active),
+    onTasksChanged: () => widget.update(),
+    onTaskCompleted: (taskId, turn) => autoClear.trackCompletion(taskId, turn),
+    onBatchCountdownReset: () => autoClear.resetBatchCountdown(),
+  });
 
   // ── Subagent completion listener ──
-  pi.events.on("subagents:completed", async (data) => {
+  subagents.subscribe("subagents:completed", async (data) => {
     await taskExecution.handleCompleted(data as { id: string; result?: string });
   });
 
-  pi.events.on("subagents:failed", (data) => {
+  subagents.subscribe("subagents:failed", (data) => {
     taskExecution.handleFailed(data as { id: string; error?: string; result?: string; status: string });
   });
 
@@ -292,7 +226,7 @@ export default function (pi: ExtensionAPI) {
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     for (const task of store.list()) {
-      if (task.status === "in_progress" && !task.execution?.agentId) {
+      if (task.status === "in_progress" && !executionAgentId(task)) {
         widget.setActiveTask(task.id, false);
       }
     }
@@ -347,9 +281,9 @@ export default function (pi: ExtensionAPI) {
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     showPersistedTasks();
+    const pendingWarning = subagents.takePendingWarning();
     if (pendingWarning) {
       ctx.ui.notify(pendingWarning, "warning");
-      pendingWarning = undefined;
     }
   });
 
@@ -458,10 +392,8 @@ All tasks are created with status \`pending\`.
     }),
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      autoClear.resetBatchCountdown();
       const meta = params.metadata ?? {};
-      const task = store.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined, params.agentType);
-      widget.update();
+      const task = taskLifecycle.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined, params.agentType);
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
     },
   });
@@ -516,10 +448,7 @@ Use TaskGet with a specific task ID to view full details including description a
 
         // Only show non-completed blockers
         if (task.blockedBy.length > 0) {
-          const openBlockers = task.blockedBy.filter(bid => {
-            const blocker = store.get(bid);
-            return blocker && blocker.status !== "completed";
-          });
+          const openBlockers = openBlockersForTask(task);
           if (openBlockers.length > 0) {
             line += ` [blocked by ${openBlockers.map(id => "#" + id).join(", ")}]`;
           }
@@ -581,10 +510,7 @@ Returns full task details:
       lines.push(`Description: ${desc}`);
 
       if (task.blockedBy.length > 0) {
-        const openBlockers = task.blockedBy.filter(bid => {
-          const blocker = store.get(bid);
-          return blocker && blocker.status !== "completed";
-        });
+        const openBlockers = openBlockersForTask(task);
         if (openBlockers.length > 0) {
           lines.push(`Blocked by: ${openBlockers.map(id => "#" + id).join(", ")}`);
         }
@@ -709,24 +635,12 @@ Set up task dependencies:
 
     execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const { taskId, ...fields } = params;
-      const { task, changedFields, warnings } = store.update(taskId, fields);
+      const { task, changedFields, warnings } = taskLifecycle.update(taskId, fields);
 
       if (changedFields.length === 0 && !task) {
         return Promise.resolve(textResult(`Task #${taskId} not found`));
       }
 
-      // Update widget active task tracking
-      if (fields.status === "in_progress") {
-        widget.setActiveTask(taskId);
-        autoClear.resetBatchCountdown();
-      } else if (fields.status === "pending") {
-        autoClear.resetBatchCountdown();
-      } else if (fields.status === "completed" || fields.status === "deleted") {
-        widget.setActiveTask(taskId, false);
-        if (fields.status === "completed") autoClear.trackCompletion(taskId, currentTurn);
-      }
-
-      widget.update();
       let msg = `Updated task #${taskId} ${changedFields.join(", ")}`;
       if (warnings.length > 0) {
         msg += ` (warning: ${warnings.join("; ")})`;
@@ -853,10 +767,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         throw new Error(`No running background process for task ${taskId}`);
       }
 
-      store.update(taskId, { status: "completed" });
-      autoClear.trackCompletion(taskId, currentTurn);
-      widget.setActiveTask(taskId, false);
-      widget.update();
+      taskLifecycle.markCompleted(taskId);
       return textResult(`Task #${taskId} stopped successfully`);
     },
   });
@@ -893,7 +804,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      if (!subagentsAvailable) {
+      if (!subagents.isAvailable()) {
         return textResult(
           "Subagent execution is currently unavailable. " +
           "Ensure the pi-interactive-subagents extension is loaded and try again."
@@ -1014,20 +925,13 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         const action = await ui.select(title, actions);
 
         if (action === "▸ Start (in_progress)") {
-          store.update(taskId, { status: "in_progress" });
-          widget.setActiveTask(taskId);
-          widget.update();
+          taskLifecycle.update(taskId, { status: "in_progress" });
           return viewTasks();
         } else if (action === "✓ Complete") {
-          store.update(taskId, { status: "completed" });
-          autoClear.trackCompletion(taskId, currentTurn);
-          widget.setActiveTask(taskId, false);
-          widget.update();
+          taskLifecycle.markCompleted(taskId);
           return viewTasks();
         } else if (action === "✗ Delete") {
-          store.update(taskId, { status: "deleted" });
-          widget.setActiveTask(taskId, false);
-          widget.update();
+          taskLifecycle.update(taskId, { status: "deleted" });
           return viewTasks();
         }
         return viewTasks();
@@ -1042,8 +946,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         const description = await ui.input("Task description");
         if (!description) return mainMenu();
 
-        store.create(subject, description);
-        widget.update();
+        taskLifecycle.create(subject, description);
         return mainMenu();
       };
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { boundedOutput, executionAgentId, openBlockers, terminalExecutionResult } from "./task-projections.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task } from "./types.js";
 
@@ -40,11 +41,6 @@ export interface OutputResult {
 }
 
 const PREREQUISITE_RESULT_LIMIT = 4000;
-
-function boundedOutput(content: unknown, maxChars = 50_000): string {
-  const text = typeof content === "string" ? content : "";
-  return text.length > maxChars ? text.slice(0, maxChars) + "\n\n[... truncated]" : text;
-}
 
 export class TaskExecution {
   private agentTaskMap = new Map<string, { taskId: string; executionId: string }>();
@@ -91,7 +87,7 @@ export class TaskExecution {
     }
     const task = this.deps.getStore().list().find(t => {
       const execution = t.execution;
-      const legacyAgentId = typeof t.metadata?.agentId === "string" ? t.metadata.agentId : undefined;
+      const legacyAgentId = executionAgentId(t);
       return (execution?.agentId === agentId &&
         (execution.status === "running" || execution.status === "stopping" || (opts?.allowCompleted && t.status === "completed"))) ||
         (!execution && t.status === "in_progress" && legacyAgentId === agentId);
@@ -121,11 +117,8 @@ export class TaskExecution {
     if (task.status !== "pending") return { success: false, reason: `not pending (status: ${task.status})` };
     if (!task.agentType) return { success: false, reason: "no agentType set — create with agentType parameter" };
 
-    const openBlockers = task.blockedBy.filter(bid => {
-      const blocker = this.deps.getStore().get(bid);
-      return !blocker || blocker.status !== "completed";
-    });
-    if (openBlockers.length > 0) return { success: false, reason: `blocked by ${openBlockers.map(id => "#" + id).join(", ")}` };
+    const blockers = openBlockers(task, id => this.deps.getStore().get(id));
+    if (blockers.length > 0) return { success: false, reason: `blocked by ${blockers.map(id => "#" + id).join(", ")}` };
 
     const executionId = randomUUID();
     const startedAt = Date.now();
@@ -252,14 +245,15 @@ export class TaskExecution {
         }
       }
       if (!this.deps.getStore().get(resolvedId)) {
-        const task = this.deps.getStore().list().find(t =>
-          t.execution?.agentId && (t.execution.agentId === taskOrAgentId || t.execution.agentId.startsWith(taskOrAgentId))
-        );
+        const task = this.deps.getStore().list().find(t => {
+          const agentId = executionAgentId(t);
+          return agentId && (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId));
+        });
         if (task) resolvedId = task.id;
       }
     }
     let task = this.deps.getStore().get(resolvedId);
-    let agentId = task?.execution?.agentId ?? (typeof task?.metadata?.agentId === "string" ? task.metadata.agentId : undefined);
+    let agentId = executionAgentId(task);
     if (!task || !agentId) return undefined;
 
     if (block && task.status === "in_progress") {
@@ -285,12 +279,11 @@ export class TaskExecution {
         signal?.addEventListener("abort", finish, { once: true });
       });
       task = this.deps.getStore().get(resolvedId) ?? task;
-      agentId = task.execution?.agentId ?? agentId;
+      agentId = executionAgentId(task) ?? agentId;
     }
 
-    const execution = task.execution;
-    const result = execution && (execution.status === "completed" || execution.status === "stopped") ? boundedOutput(execution.result) : undefined;
-    const outputFile = execution && (execution.status === "completed" || execution.status === "stopped") ? execution.outputFile : undefined;
+    const { result: rawResult, outputFile } = terminalExecutionResult(task.execution);
+    const result = rawResult === undefined ? undefined : boundedOutput(rawResult);
     return { taskId: resolvedId, status: task.status, agentId, result, outputFile };
   }
 
@@ -305,7 +298,7 @@ export class TaskExecution {
       }
     }
     const task = this.deps.getStore().get(resolvedId);
-    const agentId = task?.execution?.agentId ?? (typeof task?.metadata?.agentId === "string" ? task.metadata.agentId : undefined);
+    const agentId = executionAgentId(task);
     if (!task || !agentId || task.status !== "in_progress") return { stopped: false };
 
     const execution = task.execution;
