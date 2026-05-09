@@ -1,0 +1,796 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Tasks Lifecycle Explainer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: oklch(97% 0.009 230);
+      --bg-alt: oklch(94% 0.014 230);
+      --surface: oklch(99% 0.007 230);
+      --surface-elev: oklch(96% 0.012 230);
+      --border: oklch(86% 0.018 230);
+      --border-strong: oklch(68% 0.035 230);
+      --ink: oklch(23% 0.025 235);
+      --ink-dim: oklch(43% 0.025 235);
+      --ink-faint: oklch(60% 0.022 235);
+      --c-command: oklch(49% 0.15 245);
+      --c-source: oklch(45% 0.13 165);
+      --c-events: oklch(52% 0.14 40);
+      --c-projection: oklch(50% 0.13 305);
+      --c-api: oklch(48% 0.14 210);
+      --c-error: oklch(50% 0.17 25);
+      --c-command-bg: oklch(92% 0.045 245);
+      --c-source-bg: oklch(92% 0.04 165);
+      --c-events-bg: oklch(93% 0.05 40);
+      --c-projection-bg: oklch(92% 0.04 305);
+      --c-api-bg: oklch(92% 0.04 210);
+      --c-error-bg: oklch(92% 0.05 25);
+      --ok: oklch(47% 0.13 155);
+      --warn: oklch(57% 0.15 70);
+      --bad: oklch(50% 0.17 25);
+      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+      --dur-fast: 120ms;
+      --dur-base: 240ms;
+      --dur-slow: 480ms;
+      --shadow: 0 20px 60px oklch(30% 0.02 230 / 0.12);
+    }
+
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --bg: oklch(16% 0.01 230);
+      --bg-alt: oklch(20% 0.012 230);
+      --surface: oklch(22% 0.013 230);
+      --surface-elev: oklch(27% 0.014 230);
+      --border: oklch(34% 0.018 230);
+      --border-strong: oklch(48% 0.03 230);
+      --ink: oklch(91% 0.012 230);
+      --ink-dim: oklch(73% 0.015 230);
+      --ink-faint: oklch(58% 0.016 230);
+      --c-command: oklch(74% 0.12 245);
+      --c-source: oklch(72% 0.105 165);
+      --c-events: oklch(77% 0.11 55);
+      --c-projection: oklch(76% 0.105 305);
+      --c-api: oklch(74% 0.105 210);
+      --c-error: oklch(73% 0.13 25);
+      --c-command-bg: oklch(27% 0.04 245);
+      --c-source-bg: oklch(27% 0.035 165);
+      --c-events-bg: oklch(28% 0.04 55);
+      --c-projection-bg: oklch(28% 0.035 305);
+      --c-api-bg: oklch(27% 0.035 210);
+      --c-error-bg: oklch(28% 0.04 25);
+      --ok: oklch(73% 0.105 155);
+      --warn: oklch(78% 0.12 70);
+      --bad: oklch(72% 0.13 25);
+      --shadow: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: oklch(16% 0.01 230);
+        --bg-alt: oklch(20% 0.012 230);
+        --surface: oklch(22% 0.013 230);
+        --surface-elev: oklch(27% 0.014 230);
+        --border: oklch(34% 0.018 230);
+        --border-strong: oklch(48% 0.03 230);
+        --ink: oklch(91% 0.012 230);
+        --ink-dim: oklch(73% 0.015 230);
+        --ink-faint: oklch(58% 0.016 230);
+        --c-command: oklch(74% 0.12 245);
+        --c-source: oklch(72% 0.105 165);
+        --c-events: oklch(77% 0.11 55);
+        --c-projection: oklch(76% 0.105 305);
+        --c-api: oklch(74% 0.105 210);
+        --c-error: oklch(73% 0.13 25);
+        --c-command-bg: oklch(27% 0.04 245);
+        --c-source-bg: oklch(27% 0.035 165);
+        --c-events-bg: oklch(28% 0.04 55);
+        --c-projection-bg: oklch(28% 0.035 305);
+        --c-api-bg: oklch(27% 0.035 210);
+        --c-error-bg: oklch(28% 0.04 25);
+        --ok: oklch(73% 0.105 155);
+        --warn: oklch(78% 0.12 70);
+        --bad: oklch(72% 0.13 25);
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, var(--bg), var(--bg-alt));
+      color: var(--ink);
+      font-family: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.58;
+      text-wrap: pretty;
+    }
+    code, pre, .mono {
+      font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: color-mix(in oklch, var(--surface) 92%, transparent);
+      border-bottom: 1px solid var(--border);
+      backdrop-filter: blur(14px);
+    }
+    .topbar {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 18px 22px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+    h1, h2, h3 { line-height: 1.12; text-wrap: balance; margin: 0; }
+    h1 { font-size: 28px; letter-spacing: 0; }
+    h2 { font-size: 22px; margin-bottom: 12px; }
+    h3 { font-size: 15px; margin-bottom: 8px; }
+    p { margin: 0; color: var(--ink-dim); }
+    .subtitle { margin-top: 6px; max-width: 74ch; }
+    .theme-toggle, .tabs, .scenario-picker {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--ink);
+      border-radius: 8px;
+      padding: 8px 11px;
+      font: inherit;
+      cursor: pointer;
+      transition: transform var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+    }
+    button:hover { transform: translateY(-1px); border-color: var(--border-strong); }
+    button[aria-pressed="true"], .tab-button.active, .scenario-button.active {
+      background: var(--ink);
+      color: var(--bg);
+      border-color: var(--ink);
+    }
+    nav {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 22px 14px;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 24px 22px 44px;
+    }
+    .tab { display: none; }
+    .tab.active { display: block; animation: enter var(--dur-base) var(--ease-out); }
+    @keyframes enter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .grid { display: grid; gap: 16px; }
+    .grid.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .band {
+      background: var(--surface-elev);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 16px;
+      margin: 16px 0;
+      border-radius: 8px;
+    }
+    .label {
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(140px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }
+    .node {
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--c-command);
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 96px;
+    }
+    .node.source { border-left-color: var(--c-source); background: var(--c-source-bg); }
+    .node.command { border-left-color: var(--c-command); background: var(--c-command-bg); }
+    .node.events { border-left-color: var(--c-events); background: var(--c-events-bg); }
+    .node.projection { border-left-color: var(--c-projection); background: var(--c-projection-bg); }
+    .node.api { border-left-color: var(--c-api); background: var(--c-api-bg); }
+    .state-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .state-card {
+      border: 1px solid var(--border);
+      border-top: 4px solid var(--c-source);
+      border-radius: 8px;
+      padding: 14px;
+      background: var(--surface);
+    }
+    .state-card.active {
+      outline: 3px solid color-mix(in oklch, var(--c-command) 35%, transparent);
+      border-color: var(--border-strong);
+    }
+    .machine {
+      display: grid;
+      grid-template-columns: 1fr 80px 1fr 80px 1fr;
+      gap: 10px;
+      align-items: center;
+      margin: 18px 0;
+    }
+    .arrow {
+      text-align: center;
+      color: var(--ink-faint);
+      font-size: 24px;
+    }
+    .edge-list {
+      display: grid;
+      gap: 8px;
+    }
+    .edge {
+      display: grid;
+      grid-template-columns: 150px 1fr 180px;
+      gap: 12px;
+      padding: 10px;
+      border-radius: 8px;
+      background: var(--surface-elev);
+      border: 1px solid var(--border);
+    }
+    .sequence {
+      display: grid;
+      grid-template-columns: 130px repeat(5, 1fr);
+      gap: 8px;
+      align-items: stretch;
+    }
+    .lane-head, .seq-cell {
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      min-height: 54px;
+      background: var(--surface);
+    }
+    .lane-head {
+      color: var(--ink-dim);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }
+    .seq-cell.hot { background: var(--c-command-bg); border-color: var(--c-command); }
+    .scenario-layout {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 16px;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--surface-elev);
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--ink-dim);
+    }
+    .status-pill.ok { color: var(--ok); }
+    .status-pill.warn { color: var(--warn); }
+    .status-pill.bad { color: var(--bad); }
+    .task-record {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      gap: 10px;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .row.changed { animation: changed 1500ms var(--ease-out); }
+    @keyframes changed { 0% { background: var(--c-events-bg); } 100% { background: var(--surface); } }
+    .log {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+      max-height: 300px;
+      overflow: auto;
+    }
+    .log-entry {
+      border-left: 3px solid var(--c-events);
+      padding: 8px 10px;
+      background: var(--surface-elev);
+      border-radius: 6px;
+    }
+    .next-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .callout {
+      border-left: 4px solid var(--c-command);
+      background: var(--c-command-bg);
+      padding: 14px;
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    th, td {
+      text-align: left;
+      vertical-align: top;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      background: var(--surface-elev);
+    }
+    .cite {
+      color: var(--ink-faint);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .cite a { color: inherit; }
+    footer {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 0 22px 36px;
+      color: var(--ink-faint);
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      .topbar, .grid.two, .grid.three, .pipeline, .state-grid, .machine, .scenario-layout, .next-grid {
+        grid-template-columns: 1fr;
+      }
+      .arrow { transform: rotate(90deg); }
+      .sequence { grid-template-columns: 1fr; }
+      .edge { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <div>
+        <h1>Pi Tasks Lifecycle: Current States And Expected Next Shape</h1>
+        <p class="subtitle">A source-cited view of how Task Status, Task Execution, Blockers, Auto-Cascade, Auto-Clear, and the proposed Subagent Adapter relate today.</p>
+      </div>
+      <div class="theme-toggle" role="radiogroup" aria-label="Theme">
+        <button data-theme-set="auto" aria-pressed="true">auto</button>
+        <button data-theme-set="light" aria-pressed="false">light</button>
+        <button data-theme-set="dark" aria-pressed="false">dark</button>
+      </div>
+    </div>
+    <nav class="tabs" aria-label="Sections">
+      <button class="tab-button active" data-tab="overview">Overview</button>
+      <button class="tab-button" data-tab="states">States</button>
+      <button class="tab-button" data-tab="sequences">Sequences</button>
+      <button class="tab-button" data-tab="simulator">Simulator</button>
+      <button class="tab-button" data-tab="next">Expected Next</button>
+      <button class="tab-button" data-tab="sources">Source Map</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="overview" class="tab active">
+      <div class="grid two">
+        <div class="card">
+          <div class="label">What is happening now</div>
+          <h2>One Task has two lifecycles</h2>
+          <p>The stored Task Status is compact: pending, in_progress, completed. Subagent-backed work adds a second persisted Task Execution state: running, completed, failed, stopping, or stopped. The confusing cases come from translating between those two lifecycles.</p>
+          <div class="cite">Cites: <a href="#src-types">src/types.ts:5-28</a></div>
+        </div>
+        <div class="card">
+          <div class="label">Architectural pressure</div>
+          <h2>Protocol behavior lives in the entrypoint</h2>
+          <p>The pi RPC request/reply protocol, subagent version detection, spawn/stop calls, event subscription, widget updates, and Task Execution dependencies are wired together in the extension entrypoint. That makes the Subagent Adapter the highest-leverage next Module.</p>
+          <div class="cite">Cites: <a href="#src-index">src/index.ts:137-229</a></div>
+        </div>
+      </div>
+
+      <div class="band">
+        <div class="label">Current composition flow</div>
+        <div class="pipeline">
+          <div class="node source">
+            <h3>Task Store</h3>
+            <p>Source of truth for Task List, Task Status, Blockers, Owner, and execution payload.</p>
+          </div>
+          <div class="node command">
+            <h3>Tool Handlers</h3>
+            <p>TaskCreate, TaskUpdate, TaskClaim, TaskExecute, TaskOutput, TaskStop.</p>
+          </div>
+          <div class="node events">
+            <h3>pi Events/RPC</h3>
+            <p>Ping, spawn, stop, completed, failed, and notification delivery.</p>
+          </div>
+          <div class="node projection">
+            <h3>Task Execution</h3>
+            <p>Launches agents, maps agent IDs to Tasks, writes results, and cascades.</p>
+          </div>
+          <div class="node api">
+            <h3>Widget/Reads</h3>
+            <p>TaskList, TaskGet, output, active spinner, Auto-Clear, reminders.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid three">
+        <div class="card">
+          <div class="label">Invariant</div>
+          <h3>Blocked work cannot start</h3>
+          <p>TaskClaim and TaskExecution both treat missing or non-completed Blockers as open.</p>
+        </div>
+        <div class="card">
+          <div class="label">Invariant</div>
+          <h3>Failed execution is retryable</h3>
+          <p>A failed subagent sets Task Status back to pending while preserving failure metadata in Task Execution.</p>
+        </div>
+        <div class="card">
+          <div class="label">Invariant</div>
+          <h3>Stopped means completed</h3>
+          <p>Intentional stop is represented as Task Status completed with Task Execution stopped.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="states" class="tab">
+      <div class="grid two">
+        <div class="card">
+          <div class="label">Stored Task Status</div>
+          <div class="machine">
+            <div class="state-card" data-state-card="pending">
+              <h3>pending</h3>
+              <p>Created or retryable. May be blocked by open Blockers.</p>
+            </div>
+            <div class="arrow">→</div>
+            <div class="state-card" data-state-card="in_progress">
+              <h3>in_progress</h3>
+              <p>Manual active work or running Subagent Task.</p>
+            </div>
+            <div class="arrow">→</div>
+            <div class="state-card" data-state-card="completed">
+              <h3>completed</h3>
+              <p>Resolved, stopped, or shell-stop treated as done.</p>
+            </div>
+          </div>
+          <p>There is also a delete command path, but deletion is not a stored Task Status: `status: "deleted"` removes the Task from the store.</p>
+          <div class="cite">Cites: <a href="#src-store">src/task-store.ts:187-214</a>, <a href="#src-index">src/index.ts:658-662</a></div>
+        </div>
+        <div class="card">
+          <div class="label">Persisted Task Execution</div>
+          <div class="state-grid">
+            <div class="state-card"><h3>running</h3><p>executionId, optional agentId, startedAt.</p></div>
+            <div class="state-card"><h3>completed</h3><p>agentId, completedAt, result, outputFile.</p></div>
+            <div class="state-card"><h3>failed</h3><p>agentId optional, failedAt, error.</p></div>
+            <div class="state-card"><h3>stopping</h3><p>Defined type, not currently written by stop path.</p></div>
+            <div class="state-card"><h3>stopped</h3><p>agentId, stoppedAt, optional result and outputFile.</p></div>
+          </div>
+          <div class="cite">Cites: <a href="#src-types">src/types.ts:7-12</a></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="label">Transition table</div>
+        <div class="edge-list" id="transition-table"></div>
+      </div>
+    </section>
+
+    <section id="sequences" class="tab">
+      <div class="card">
+        <div class="label">Sequence player</div>
+        <div class="scenario-picker" style="margin-bottom:14px">
+          <button class="sequence-button active" data-seq="execute">TaskExecute happy path</button>
+          <button class="sequence-button" data-seq="failure">Spawn/event failure</button>
+          <button class="sequence-button" data-seq="cascade">Auto-Cascade</button>
+        </div>
+        <div class="sequence" id="sequence-view"></div>
+      </div>
+    </section>
+
+    <section id="simulator" class="tab">
+      <div class="scenario-layout">
+        <div class="card">
+          <div class="label">Scenario</div>
+          <div class="scenario-picker" id="scenario-picker"></div>
+          <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap">
+            <button id="prev-step">prev</button>
+            <button id="next-step" aria-pressed="true">next</button>
+            <button id="reset-step">reset</button>
+          </div>
+          <div class="log" id="scenario-log"></div>
+        </div>
+        <div class="card">
+          <div class="label">Task record after current step</div>
+          <h2 id="scenario-title"></h2>
+          <p id="scenario-note"></p>
+          <div class="task-record" id="task-record"></div>
+          <div class="band">
+            <div class="label">Invariant checks</div>
+            <div id="invariant-checks"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="next" class="tab">
+      <div class="next-grid">
+        <div class="card">
+          <div class="label">Expected next Module</div>
+          <h2>Subagent Adapter</h2>
+          <p>Place a seam between pi event protocol details and Task Execution. The Adapter owns version detection, RPC envelopes, timeouts, spawn/stop, and subscriptions. Task Execution keeps the domain lifecycle.</p>
+          <div class="cite">Current coupling: <a href="#src-index">src/index.ts:137-184</a></div>
+        </div>
+        <div class="card">
+          <div class="label">Deletion test</div>
+          <h2>Why this Module is deep enough</h2>
+          <p>If the Adapter is deleted, protocol complexity reappears in TaskExecute, TaskExecution tests, availability checks, stop handling, and event listeners. That means the Module would buy real locality.</p>
+        </div>
+      </div>
+
+      <div class="callout" style="margin-top:16px">
+        <h3>Recommended Interface shape to explore</h3>
+        <p>Result-based availability: TaskExecute calls TaskExecution; TaskExecution calls the Adapter; Adapter methods return domain-friendly results instead of leaking `subagentsAvailable`, ping replies, or channel names. That keeps the caller from learning protocol ordering.</p>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <div class="label">Before / after seam placement</div>
+        <table>
+          <thead><tr><th>Concern</th><th>Current place</th><th>Expected place</th></tr></thead>
+          <tbody>
+            <tr><td>RPC request IDs and reply channels</td><td>index.ts helpers</td><td>Subagent Adapter Implementation</td></tr>
+            <tr><td>Subagent protocol version</td><td>index.ts mutable state</td><td>Subagent Adapter readiness result</td></tr>
+            <tr><td>Task Status and Task Execution transitions</td><td>TaskExecution plus tool side effects</td><td>TaskExecution, with Adapter as dependency</td></tr>
+            <tr><td>Widget and Auto-Clear side effects</td><td>Injected callbacks</td><td>Still injected callbacks, possibly later Task lifecycle Module</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="sources" class="tab">
+      <div class="card">
+        <div class="label">Source map</div>
+        <table>
+          <thead><tr><th id="src-types">File</th><th>Lines</th><th>Why it matters</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">src/types.ts</td><td class="mono">5-28</td><td>Defines stored Task Status, persisted Task Execution, and Task fields.</td></tr>
+            <tr><td class="mono" id="src-store">src/task-store.ts</td><td class="mono">150-335</td><td>Creates Tasks, applies generic updates, deletes Tasks, maintains Blocker edges, and atomically claims Tasks.</td></tr>
+            <tr><td class="mono">src/task-execution.ts</td><td class="mono">102-199</td><td>Executes Subagent Tasks, checks Blockers, marks running/completed, and triggers Auto-Cascade.</td></tr>
+            <tr><td class="mono">src/task-execution.ts</td><td class="mono">202-327</td><td>Handles failed/stopped events, output waits, and TaskStop for subagents.</td></tr>
+            <tr><td class="mono" id="src-index">src/index.ts</td><td class="mono">137-229</td><td>Current pi RPC helpers, version detection, Subagent Task Execution wiring, and event listeners.</td></tr>
+            <tr><td class="mono">src/index.ts</td><td class="mono">403-929</td><td>Tool-level commands and side effects for create, update, claim, output, stop, and execute.</td></tr>
+            <tr><td class="mono">src/auto-clear.ts</td><td class="mono">15-83</td><td>Turn-based derived cleanup behavior for completed Tasks.</td></tr>
+            <tr><td class="mono">src/ui/task-widget.ts</td><td class="mono">65-353</td><td>Derived visual state: active spinner, recent completion, ordering, metrics, and truncation.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Scenarios are illustrative simulations of source-of-truth behavior from the cited files, not live runs against pi.
+  </footer>
+
+  <script>
+    const storageKey = "pi-tasks-lifecycle-explainer-theme";
+    const themeButtons = [...document.querySelectorAll("[data-theme-set]")];
+    function setTheme(mode) {
+      localStorage.setItem(storageKey, mode);
+      if (mode === "auto") document.documentElement.removeAttribute("data-theme");
+      else document.documentElement.setAttribute("data-theme", mode);
+      themeButtons.forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.themeSet === mode)));
+    }
+    setTheme(localStorage.getItem(storageKey) || "auto");
+    themeButtons.forEach((button) => button.addEventListener("click", () => setTheme(button.dataset.themeSet)));
+
+    const tabButtons = [...document.querySelectorAll(".tab-button")];
+    const tabs = [...document.querySelectorAll(".tab")];
+    tabButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        tabButtons.forEach((b) => b.classList.remove("active"));
+        tabs.forEach((tab) => tab.classList.remove("active"));
+        button.classList.add("active");
+        document.getElementById(button.dataset.tab).classList.add("active");
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+    });
+
+    const transitions = [
+      { from: "none", to: "pending", trigger: "TaskCreate", note: "Creates Task with status pending.", cite: "task-store.ts:150-173" },
+      { from: "pending", to: "in_progress", trigger: "TaskUpdate", note: "Manual start; widget active state is separate.", cite: "index.ts:718-727" },
+      { from: "pending", to: "in_progress + execution.running", trigger: "TaskExecute", note: "Only if pending, has agentType, and Blockers are complete.", cite: "task-execution.ts:120-149" },
+      { from: "in_progress + running", to: "completed + execution.completed", trigger: "subagents:completed", note: "Writes output, notifies, maybe cascades.", cite: "task-execution.ts:162-199" },
+      { from: "in_progress + running", to: "pending + execution.failed", trigger: "subagents:failed", note: "Retryable failure; resets Auto-Cascade batch countdown.", cite: "task-execution.ts:202-240" },
+      { from: "in_progress + running", to: "completed + execution.stopped", trigger: "TaskStop", note: "Marks stopped before/while asking subagent to stop.", cite: "task-execution.ts:297-327" },
+      { from: "any", to: "deleted", trigger: "TaskUpdate deleted", note: "Deletes record and removes Blocker edges.", cite: "task-store.ts:206-214" }
+    ];
+
+    document.getElementById("transition-table").innerHTML = transitions.map((edge) => `
+      <div class="edge">
+        <div class="mono">${edge.from} → ${edge.to}</div>
+        <div><strong>${edge.trigger}</strong><br>${edge.note}</div>
+        <div class="cite">${edge.cite}</div>
+      </div>
+    `).join("");
+
+    const sequences = {
+      execute: [
+        ["Tool", "TaskExecute checks subagentsAvailable"],
+        ["TaskExecution", "loads Task and validates pending / agentType / Blockers"],
+        ["Store", "status becomes in_progress; execution becomes running with agentId null"],
+        ["pi RPC", "spawn returns agent ID"],
+        ["Store", "owner becomes agent ID; execution.running gets agentId"]
+      ],
+      failure: [
+        ["Tool", "TaskExecute starts launch"],
+        ["Store", "Task temporarily becomes in_progress"],
+        ["pi RPC", "spawn throws or later emits failed"],
+        ["TaskExecution", "captures error"],
+        ["Store", "Task becomes pending; execution becomes failed"]
+      ],
+      cascade: [
+        ["Event", "subagents:completed arrives"],
+        ["Store", "completed Task stores result and outputFile"],
+        ["TaskExecution", "finds pending dependents whose Blockers are all completed"],
+        ["TaskExecution", "launches each unblocked Subagent Task"],
+        ["Widget", "updates active task display"]
+      ]
+    };
+
+    function renderSequence(name) {
+      const rows = sequences[name];
+      document.getElementById("sequence-view").innerHTML = `
+        <div class="lane-head">Step</div>
+        ${rows.map((_, index) => `<div class="lane-head">${index + 1}</div>`).join("")}
+        <div class="lane-head">Lane</div>
+        ${rows.map((row) => `<div class="seq-cell hot">${row[0]}</div>`).join("")}
+        <div class="lane-head">Action</div>
+        ${rows.map((row) => `<div class="seq-cell">${row[1]}</div>`).join("")}
+      `;
+    }
+    renderSequence("execute");
+    document.querySelectorAll(".sequence-button").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll(".sequence-button").forEach((b) => b.classList.remove("active"));
+        button.classList.add("active");
+        renderSequence(button.dataset.seq);
+      });
+    });
+
+    const scenarios = {
+      happy: {
+        title: "Happy path Subagent Task",
+        note: "A pending Task with an agentType and no open Blockers moves through running to completed.",
+        steps: [
+          { log: "TaskCreate", task: { status: "pending", execution: "none", owner: "none", blockers: "none" } },
+          { log: "TaskExecute validates and marks running", task: { status: "in_progress", execution: "running(agentId: null)", owner: "none", blockers: "none" } },
+          { log: "spawn returns agent-1", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
+          { log: "subagents:completed writes result", task: { status: "completed", execution: "completed(result, outputFile)", owner: "agent-1", blockers: "none" } }
+        ]
+      },
+      blocked: {
+        title: "Blocked Subagent Task",
+        note: "Open Blockers prevent claim and execution. Missing Blockers are treated as open.",
+        steps: [
+          { log: "Task has blockedBy [#1]", task: { status: "pending", execution: "none", owner: "none", blockers: "#1 open" } },
+          { log: "TaskExecute skips the Task", task: { status: "pending", execution: "none", owner: "none", blockers: "#1 open" } },
+          { log: "Blocker #1 completes", task: { status: "pending", execution: "none", owner: "none", blockers: "none" } },
+          { log: "Task can now execute", task: { status: "in_progress", execution: "running(agentId: agent-2)", owner: "agent-2", blockers: "none" } }
+        ]
+      },
+      failure: {
+        title: "Failed execution and retry",
+        note: "Failure preserves execution failure details but returns Task Status to pending.",
+        steps: [
+          { log: "TaskExecute starts", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
+          { log: "subagents:failed arrives", task: { status: "pending", execution: "failed(error)", owner: "agent-1", blockers: "none" } },
+          { log: "TaskExecute retry starts new execution", task: { status: "in_progress", execution: "running(agentId: agent-2)", owner: "agent-2", blockers: "none" } },
+          { log: "retry completes", task: { status: "completed", execution: "completed(result)", owner: "agent-2", blockers: "none" } }
+        ]
+      },
+      stopped: {
+        title: "Intentional stop",
+        note: "Stop is terminal from the Task Status perspective, even if final output arrives later.",
+        steps: [
+          { log: "Task is running", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
+          { log: "TaskStop called", task: { status: "completed", execution: "stopped(no result yet)", owner: "agent-1", blockers: "none" } },
+          { log: "subagents:failed status stopped with partial result", task: { status: "completed", execution: "stopped(partial result, outputFile)", owner: "agent-1", blockers: "none" } }
+        ]
+      }
+    };
+
+    let scenarioName = "happy";
+    let stepIndex = 0;
+
+    const picker = document.getElementById("scenario-picker");
+    picker.innerHTML = Object.keys(scenarios).map((name) => `<button class="scenario-button ${name === scenarioName ? "active" : ""}" data-scenario="${name}">${name}</button>`).join("");
+    picker.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-scenario]");
+      if (!button) return;
+      scenarioName = button.dataset.scenario;
+      stepIndex = 0;
+      document.querySelectorAll(".scenario-button").forEach((b) => b.classList.remove("active"));
+      button.classList.add("active");
+      renderScenario();
+    });
+
+    function invariantRows(task) {
+      const rows = [];
+      rows.push({ label: "If execution is running, Task Status is in_progress", ok: !task.execution.startsWith("running") || task.status === "in_progress" });
+      rows.push({ label: "If execution failed, Task Status is pending", ok: !task.execution.startsWith("failed") || task.status === "pending" });
+      rows.push({ label: "If Task is blocked, execution should not be running", ok: task.blockers === "none" || !task.execution.startsWith("running") });
+      rows.push({ label: "Stopped execution maps to completed Task Status", ok: !task.execution.startsWith("stopped") || task.status === "completed" });
+      return rows;
+    }
+
+    function renderScenario() {
+      const scenario = scenarios[scenarioName];
+      const step = scenario.steps[stepIndex];
+      const task = step.task;
+      document.getElementById("scenario-title").textContent = scenario.title;
+      document.getElementById("scenario-note").textContent = `${scenario.note} Step ${stepIndex + 1} of ${scenario.steps.length}.`;
+      document.getElementById("task-record").innerHTML = Object.entries(task).map(([key, value]) => `
+        <div class="row changed"><div class="mono">${key}</div><div>${value}</div></div>
+      `).join("");
+      document.getElementById("scenario-log").innerHTML = scenario.steps.map((s, index) => `
+        <div class="log-entry" style="${index === stepIndex ? "border-left-color: var(--c-command)" : ""}">
+          <span class="mono">${index + 1}</span> ${s.log}
+        </div>
+      `).join("");
+      document.getElementById("invariant-checks").innerHTML = invariantRows(task).map((row) => `
+        <div class="status-pill ${row.ok ? "ok" : "bad"}">${row.ok ? "pass" : "fail"} · ${row.label}</div>
+      `).join(" ");
+    }
+
+    document.getElementById("next-step").addEventListener("click", () => {
+      stepIndex = Math.min(stepIndex + 1, scenarios[scenarioName].steps.length - 1);
+      renderScenario();
+    });
+    document.getElementById("prev-step").addEventListener("click", () => {
+      stepIndex = Math.max(stepIndex - 1, 0);
+      renderScenario();
+    });
+    document.getElementById("reset-step").addEventListener("click", () => {
+      stepIndex = 0;
+      renderScenario();
+    });
+    renderScenario();
+  </script>
+</body>
+</html>
