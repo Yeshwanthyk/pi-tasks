@@ -831,12 +831,12 @@ describe("RPC protocol correctness", () => {
     expect(rpc.stopped).toContain("agent-1");
 
     const task = await mock.executeTool("TaskGet", { taskId: "1" });
-    expect(task.content[0].text).toContain("Status: completed");
+    expect(task.content[0].text).toContain("Status: pending");
 
     rpc.unsub();
   });
 
-  it("preserves stopped subagent partial result after TaskStop pre-completes the task", async () => {
+  it("preserves stopped subagent partial result while leaving the task pending", async () => {
     const mock = mockPi();
     const rpc = installSubagentsMock(mock.pi);
     initExtension(mock.pi as any);
@@ -852,7 +852,7 @@ describe("RPC protocol correctness", () => {
     mock.emitEvent("subagents:failed", { id: "agent-1", status: "stopped", result: "partial output" });
 
     const task = await mock.executeTool("TaskGet", { taskId: "1" });
-    expect(task.content[0].text).toContain("Status: completed");
+    expect(task.content[0].text).toContain("Status: pending");
     expect(task.content[0].text).toContain("partial output");
 
     rpc.unsub();

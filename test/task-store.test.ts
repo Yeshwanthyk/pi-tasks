@@ -29,6 +29,19 @@ describe("TaskStore (in-memory)", () => {
     expect(t.metadata).toEqual({ key: "value" });
   });
 
+  it("stores project and origin session identity", () => {
+    const project = {
+      name: "pi-tasks",
+      root: "/code/pi-tasks",
+      remote: "git@github.com:Yeshwanthyk/pi-tasks.git",
+      branch: "master",
+    };
+    const task = store.create("Task", "Desc", undefined, undefined, undefined, project, "session-1");
+
+    expect(task.project).toEqual(project);
+    expect(task.sessionId).toBe("session-1");
+  });
+
   it("gets a task by ID", () => {
     store.create("Test", "Desc");
     const task = store.get("1");
@@ -180,28 +193,28 @@ describe("TaskStore (in-memory)", () => {
     expect(retrieved.metadata).toEqual({ pr: "123", reviewer: "alice" });
   });
 
-  it("allows circular dependencies with warning", () => {
+  it("rejects circular dependencies", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { addBlocks: ["2"] });
     const { warnings } = store.update("2", { addBlocks: ["1"] });
 
     expect(store.get("1")!.blocks).toContain("2");
-    expect(store.get("2")!.blocks).toContain("1");
-    expect(warnings).toContain("cycle: #2 and #1 block each other");
+    expect(store.get("2")!.blocks).not.toContain("1");
+    expect(warnings).toContain("dependency would create a cycle between #2 and #1");
   });
 
-  it("allows self-dependency with warning", () => {
+  it("rejects self-dependency", () => {
     store.create("Self", "Desc");
     const { warnings } = store.update("1", { addBlocks: ["1"] });
-    expect(store.get("1")!.blocks).toContain("1");
-    expect(warnings).toContain("#1 blocks itself");
+    expect(store.get("1")!.blocks).not.toContain("1");
+    expect(warnings).toContain("#1 cannot depend on itself");
   });
 
-  it("stores dangling edge IDs with warning", () => {
+  it("rejects dangling edge IDs", () => {
     store.create("Real", "Desc");
     const { warnings } = store.update("1", { addBlocks: ["9999"] });
-    expect(store.get("1")!.blocks).toContain("9999");
+    expect(store.get("1")!.blocks).not.toContain("9999");
     expect(warnings).toContain("#9999 does not exist");
   });
 
@@ -262,26 +275,44 @@ describe("TaskStore (in-memory)", () => {
     expect(store.get("3")!.blockedBy).toContain("1");
   });
 
-  it("addBlockedBy warns on self-dependency", () => {
+  it("addBlockedBy rejects self-dependency", () => {
     store.create("Self", "Desc");
     const { warnings } = store.update("1", { addBlockedBy: ["1"] });
-    expect(store.get("1")!.blockedBy).toContain("1");
-    expect(warnings).toContain("#1 blocks itself");
+    expect(store.get("1")!.blockedBy).not.toContain("1");
+    expect(warnings).toContain("#1 cannot depend on itself");
   });
 
-  it("addBlockedBy warns on dangling ref", () => {
+  it("addBlockedBy rejects dangling refs", () => {
     store.create("Real", "Desc");
     const { warnings } = store.update("1", { addBlockedBy: ["9999"] });
-    expect(store.get("1")!.blockedBy).toContain("9999");
+    expect(store.get("1")!.blockedBy).not.toContain("9999");
     expect(warnings).toContain("#9999 does not exist");
   });
 
-  it("addBlockedBy warns on cycle", () => {
+  it("addBlockedBy rejects cycles", () => {
     store.create("A", "Desc");
     store.create("B", "Desc");
     store.update("1", { addBlocks: ["2"] });
     const { warnings } = store.update("1", { addBlockedBy: ["2"] });
-    expect(warnings).toContain("cycle: #1 and #2 block each other");
+    expect(warnings).toContain("dependency would create a cycle between #2 and #1");
+  });
+
+  it("rejects multi-hop cycles atomically", () => {
+    store.create("A", "Desc");
+    store.create("B", "Desc");
+    store.create("C", "Desc");
+    store.update("1", { addBlocks: ["2"] });
+    store.update("2", { addBlocks: ["3"] });
+
+    const { changedFields, warnings } = store.update("3", {
+      subject: "Should not change",
+      addBlocks: ["1"],
+    });
+
+    expect(changedFields).toEqual([]);
+    expect(warnings).toContain("dependency would create a cycle between #3 and #1");
+    expect(store.get("3")!.subject).toBe("C");
+    expect(store.get("3")!.blocks).toEqual([]);
   });
 
   it("clearCompleted returns 0 when no completed tasks", () => {

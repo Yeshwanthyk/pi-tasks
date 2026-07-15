@@ -1,5 +1,5 @@
 import type { TaskStore } from "./task-store.js";
-import type { Task, TaskStatus } from "./types.js";
+import type { Task, TaskProject, TaskStatus } from "./types.js";
 
 export interface TaskLifecycleDeps {
   getStore(): TaskStore;
@@ -32,9 +32,11 @@ export class TaskLifecycle {
     activeForm?: string,
     metadata?: Record<string, unknown>,
     agentType?: string,
+    project?: TaskProject,
+    sessionId?: string,
   ): Task {
     this.deps.onBatchCountdownReset();
-    const task = this.deps.getStore().create(subject, description, activeForm, metadata, agentType);
+    const task = this.deps.getStore().create(subject, description, activeForm, metadata, agentType, project, sessionId);
     this.deps.onTasksChanged();
     return task;
   }

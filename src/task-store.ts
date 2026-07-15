@@ -8,7 +8,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import type { Task, TaskStatus, TaskStoreData } from "./types.js";
+import { decodeTaskStoreData, encodeTaskStoreData } from "./task-schemas.js";
+import type { Task, TaskProject, TaskStatus, TaskStoreData } from "./types.js";
 
 export type ClaimTaskResult =
   | { success: true; task: Task; changedFields: string[] }
@@ -96,7 +97,7 @@ export class TaskStore {
       return;
     }
     try {
-      const data: TaskStoreData = JSON.parse(readFileSync(this.filePath, "utf-8"));
+      const data: TaskStoreData = decodeTaskStoreData(readFileSync(this.filePath, "utf-8"));
       const highestTaskId = data.tasks.reduce((max, task) => Math.max(max, Number(task.id) || 0), 0);
       this.highWaterMark = Math.max(diskHighWaterMark, data.highWaterMark ?? 0, highestTaskId, data.nextId - 1);
       this.nextId = Math.max(data.nextId, this.highWaterMark + 1);
@@ -128,7 +129,7 @@ export class TaskStore {
       tasks: Array.from(this.tasks.values()),
     };
     const tmpPath = this.filePath + ".tmp";
-    writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+    writeFileSync(tmpPath, encodeTaskStoreData(data));
     renameSync(tmpPath, this.filePath);
     this.writeHighWaterMark();
   }
@@ -147,7 +148,15 @@ export class TaskStore {
     }
   }
 
-  create(subject: string, description: string, activeForm?: string, metadata?: Record<string, unknown>, agentType?: string): Task {
+  create(
+    subject: string,
+    description: string,
+    activeForm?: string,
+    metadata?: Record<string, unknown>,
+    agentType?: string,
+    project?: TaskProject,
+    sessionId?: string,
+  ): Task {
     return this.withLock(() => {
       const normalizedAgentType = agentType ?? (typeof metadata?.agentType === "string" ? metadata.agentType : undefined);
       const now = Date.now();
@@ -162,6 +171,8 @@ export class TaskStore {
         activeForm,
         owner: undefined,
         agentType: normalizedAgentType,
+        project,
+        sessionId,
         metadata: metadata ?? {},
         blocks: [],
         blockedBy: [],
@@ -201,7 +212,8 @@ export class TaskStore {
       if (!task) return { task: undefined, changedFields: [], warnings: [] };
 
       const changedFields: string[] = [];
-      const warnings: string[] = [];
+      const warnings = this.validateDependencyUpdate(id, fields.addBlocks ?? [], fields.addBlockedBy ?? []);
+      if (warnings.length > 0) return { task, changedFields, warnings };
 
       // Handle deletion
       if (fields.status === "deleted") {
@@ -266,14 +278,6 @@ export class TaskStore {
             target.blockedBy.push(id);
             target.updatedAt = Date.now();
           }
-          // Warnings for problematic edges
-          if (targetId === id) {
-            warnings.push(`#${id} blocks itself`);
-          } else if (!target) {
-            warnings.push(`#${targetId} does not exist`);
-          } else if (target.blocks.includes(id)) {
-            warnings.push(`cycle: #${id} and #${targetId} block each other`);
-          }
         }
         changedFields.push("blocks");
       }
@@ -288,14 +292,6 @@ export class TaskStore {
             target.blocks.push(id);
             target.updatedAt = Date.now();
           }
-          // Warnings for problematic edges
-          if (targetId === id) {
-            warnings.push(`#${id} blocks itself`);
-          } else if (!target) {
-            warnings.push(`#${targetId} does not exist`);
-          } else if (task.blocks.includes(targetId)) {
-            warnings.push(`cycle: #${id} and #${targetId} block each other`);
-          }
         }
         changedFields.push("blockedBy");
       }
@@ -303,6 +299,45 @@ export class TaskStore {
       task.updatedAt = Date.now();
       return { task, changedFields, warnings };
     });
+  }
+
+  private validateDependencyUpdate(id: string, addBlocks: string[], addBlockedBy: string[]): string[] {
+    const errors: string[] = [];
+    const additions = [
+      ...addBlocks.map(targetId => ({ from: id, to: targetId })),
+      ...addBlockedBy.map(blockerId => ({ from: blockerId, to: id })),
+    ];
+    if (additions.length === 0) return errors;
+
+    for (const edge of additions) {
+      if (edge.from === edge.to) errors.push("#" + id + " cannot depend on itself");
+      if (!this.tasks.has(edge.from)) errors.push("#" + edge.from + " does not exist");
+      if (!this.tasks.has(edge.to)) errors.push("#" + edge.to + " does not exist");
+    }
+    if (errors.length > 0) return [...new Set(errors)];
+
+    const graph = new Map<string, Set<string>>();
+    for (const task of this.tasks.values()) graph.set(task.id, new Set(task.blocks));
+
+    const hasPath = (from: string, to: string, seen = new Set<string>()): boolean => {
+      if (from === to) return true;
+      if (seen.has(from)) return false;
+      seen.add(from);
+      for (const next of graph.get(from) ?? []) {
+        if (hasPath(next, to, seen)) return true;
+      }
+      return false;
+    };
+
+    for (const edge of additions) {
+      if (graph.get(edge.from)?.has(edge.to)) continue;
+      if (hasPath(edge.to, edge.from)) {
+        errors.push("dependency would create a cycle between #" + edge.from + " and #" + edge.to);
+        continue;
+      }
+      graph.get(edge.from)?.add(edge.to);
+    }
+    return [...new Set(errors)];
   }
 
   /** Atomically claim a task for an owner if it is available. */

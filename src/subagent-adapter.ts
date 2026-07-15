@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { Effect } from "effect";
+import { SubagentRpcError } from "./effect-errors.js";
 
 export type SubagentEvent = "subagents:completed" | "subagents:failed";
 
@@ -39,43 +41,48 @@ export class SubagentAdapter {
     return warning;
   }
 
-  spawn(type: string, prompt: string, options?: unknown): Promise<string> {
+  spawn(type: string, prompt: string, options?: unknown): Effect.Effect<string, SubagentRpcError> {
     this.debug("spawn:call", { type, options: { ...(typeof options === "object" && options ? options : {}), prompt: undefined } });
-    return this.rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000)
-      .then(d => {
+    return this.rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000).pipe(
+      Effect.map(d => {
         this.debug("spawn:ok", d);
         return d.id;
-      });
+      }),
+    );
   }
 
-  stop(agentId: string): Promise<void> {
-    return this.rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
+  stop(agentId: string): Effect.Effect<void> {
+    return this.rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).pipe(Effect.ignore);
   }
 
   subscribe(event: SubagentEvent, handler: (data: unknown) => void): () => void {
     return this.events.on(event, handler);
   }
 
-  private rpcCall<T>(channel: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
+  private rpcCall<T>(channel: string, params: Record<string, unknown>, timeoutMs: number): Effect.Effect<T, SubagentRpcError> {
     const requestId = randomUUID();
     this.debug(`rpc:send ${channel}`, { requestId });
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        unsub();
-        this.debug(`rpc:timeout ${channel}`, { requestId });
-        reject(new Error(`${channel} timeout`));
-      }, timeoutMs);
+    const request = Effect.callback<T, SubagentRpcError>((resume) => {
       const unsub = this.events.on(`${channel}:reply:${requestId}`, (raw: unknown) => {
         unsub();
-        clearTimeout(timer);
         this.debug(`rpc:reply ${channel}`, { requestId, raw });
         const reply = raw as RpcReply<T>;
-        if (reply.success) resolve(reply.data as T);
-        else reject(new Error(reply.error));
+        if (reply.success) resume(Effect.succeed(reply.data as T));
+        else resume(Effect.fail(new SubagentRpcError({ operation: channel, message: reply.error })));
       });
       this.events.emit(channel, { requestId, ...params });
       this.debug(`rpc:emitted ${channel}`, { requestId });
+      return Effect.sync(unsub);
     });
+    return request.pipe(
+      Effect.timeoutOrElse({
+        duration: timeoutMs,
+        orElse: () => {
+          this.debug(`rpc:timeout ${channel}`, { requestId });
+          return Effect.fail(new SubagentRpcError({ operation: channel, message: `${channel} timeout` }));
+        },
+      }),
+    );
   }
 
   private checkVersion(): void {

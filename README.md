@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts
 - **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
-- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references
+- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with atomic rejection of cycles, self-dependencies, and dangling references
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
@@ -118,7 +118,7 @@ Update task fields, status, metadata, and dependencies.
 → Updated task #1 status
 → Updated task #2 owner, status
 → Updated task #3 blocks
-→ Updated task #3 blocks (warning: cycle: #3 and #1 block each other)
+→ Task #3 update rejected: dependency would create a cycle between #3 and #1
 → Updated task #1 deleted
 ```
 
@@ -154,6 +154,8 @@ Both task IDs and agent IDs (including partial prefixes) are accepted — agent 
 
 Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC.
 
+Stopped execution is recorded separately and the task returns to `pending`, ready to resume or retry.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `task_id` | string | Task ID or agent ID to stop |
@@ -171,6 +173,8 @@ Execute one or more tasks as background subagents. Requires [pi-interactive-suba
 
 Tasks must be `pending`, have `agentType` set, and all `blockedBy` dependencies `completed`. Each task spawns as an independent background subagent.
 
+Tasks from a named cross-project list can only be executed from their recorded workspace. Use `/tasks all` for cross-project visibility, then open Pi in the owning project to run the task.
+
 With **auto-cascade** enabled (via `/tasks` → Settings), completed tasks automatically trigger execution of their unblocked dependents — flowing through the DAG like a build system. Each cascaded agent receives its prerequisites' stored results in the prompt, so it can build directly on what came before without re-fetching.
 
 ## Task Lifecycle
@@ -182,10 +186,12 @@ pending → in_progress → completed
 
 Tasks are created as `pending`. Mark `in_progress` before starting work, `completed` when done. `deleted` removes entirely — IDs never reset.
 
+Agent execution has its own state: `running`, `completed`, `failed`, `stopping`, or `stopped`. A successful run completes its task. Failed and stopped runs leave the task pending.
+
 ## Dependency Management
 
 - **Bidirectional edges:** `addBlocks`/`addBlockedBy` maintain both sides automatically
-- **Dependency warnings:** cycles, self-dependencies, and references to non-existent tasks are stored but produce warnings in the tool response
+- **Dependency validation:** cycles, self-dependencies, and references to non-existent tasks reject the entire update without changing any task fields
 - **Display-time filtering:** `TaskList` only shows non-completed blockers in `[blocked by ...]`
 - **Raw data preserved:** `TaskGet` shows ALL edges, including completed blockers
 - **Cleanup on deletion:** removing a task cleans up all edges pointing to it
@@ -229,6 +235,8 @@ Settings (`taskScope`, `autoCascade`, `autoClearCompleted`) are saved to `<cwd>/
 
 Named and explicit paths use a file-locked store with stale-lock detection — safe for multiple pi sessions coordinating on the same task list.
 
+Every newly created task records its project name, workspace root, git remote, branch, and originating session. Named lists can therefore contain tasks from several projects without losing their origin.
+
 **CI example** (`.envrc`):
 ```bash
 export PI_TASKS=off
@@ -257,6 +265,8 @@ Tasks
 - **Clear completed** — remove all completed tasks
 - **Clear all** — remove all tasks regardless of status
 - **Settings** — configure task storage, auto-cascade, and auto-clear completed tasks (saved to `tasks-config.json`)
+
+Run `/tasks all` to show the current shared list grouped by recorded project.
 
 ## Cross-extension Communication with [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents)
 
@@ -314,10 +324,15 @@ If [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-su
 src/
 ├── index.ts            # Extension entry: 8 tools + /tasks command + widget + subagent integration
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
+├── runtime.ts          # One managed Effect v4 runtime and the Promise boundary used by Pi callbacks
+├── effect-errors.ts    # Typed failures for subagent RPC operations
+├── task-schemas.ts     # Effect Schema validation for persisted tasks and settings
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
+├── task-execution.ts   # Effect workflows for spawn, output waiting, stopping, and cascading
 ├── auto-clear.ts       # Turn-based auto-clearing of completed tasks (AutoClearManager)
 ├── tasks-config.ts     # Config persistence (taskScope, autoCascade, autoClearCompleted) → .pi/tasks-config.json
 ├── process-tracker.ts  # Background process output buffering and stop
+├── project-identity.ts  # Git workspace metadata attached to new tasks
 └── ui/
     ├── task-widget.ts  # Persistent widget with status icons and spinner
     └── settings-menu.ts  # /tasks → Settings panel (SettingsList TUI component)
@@ -331,9 +346,12 @@ src/
 
 ```bash
 npm install
-npm run typecheck   # TypeScript validation
-npm test            # Run unit tests (145 tests)
+npm run typecheck   # Effect TSGO preparation + TypeScript validation
+npm test            # Run the isolated unit and scenario suite
+npm run build       # Compile the extension
 ```
+
+The extension keeps one managed Effect v4 runtime for the Pi session. Pi's public callbacks remain Promise-based boundaries; task execution, RPC timeouts, cancellation, and clocks run as Effects. Persisted task and settings files are decoded through Effect Schema instead of trusted JSON casts.
 
 ## License
 

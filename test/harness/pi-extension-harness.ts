@@ -259,8 +259,9 @@ export class PiTasksHarness {
       const execution = task.execution;
       if (!execution) continue;
       if (execution.status === "running") expect(task.status).toBe("in_progress");
-      if (execution.status === "completed" || execution.status === "stopped" || execution.status === "stopping") expect(task.status).toBe("completed");
-      if (execution.status === "failed") expect(task.status).toBe("pending");
+      if (execution.status === "completed") expect(task.status).toBe("completed");
+      if (execution.status === "running" || execution.status === "stopping") expect(task.status).toBe("in_progress");
+      if (execution.status === "failed" || execution.status === "stopped") expect(task.status).toBe("pending");
       expect(task.metadata).not.toHaveProperty("agentId");
       expect(task.metadata).not.toHaveProperty("agentType");
       expect(task.metadata).not.toHaveProperty("executionId");

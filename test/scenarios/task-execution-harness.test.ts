@@ -75,7 +75,7 @@ describe("PiTasksHarness scenarios", () => {
     await h.expectInvariants();
   });
 
-  it("keeps dangling blocker warnings out of read projections", async () => {
+  it("rejects dangling blockers without leaking them into read projections", async () => {
     h = PiTasksHarness.create();
 
     await h.tool("TaskCreate", { subject: "A", description: "Has a dangling blocker" });
@@ -90,6 +90,29 @@ describe("PiTasksHarness scenarios", () => {
 
     await h.lifecycle("turn_start", {}, h.ctx());
     expect(h.renderWidget().join("\n")).not.toContain("blocked by #9999");
+  });
+
+  it("shows tasks grouped by project through /tasks all", async () => {
+    h = PiTasksHarness.create();
+    await h.tool("TaskCreate", { subject: "Review task flow", description: "Inspect the task model" });
+
+    const calls: Array<{ title: string; choices: string[] }> = [];
+    const baseCtx = h.ctx();
+    await h.commands.get("tasks").handler("all", {
+      ...baseCtx,
+      ui: {
+        ...baseCtx.ui,
+        select: async (title: string, choices: string[]) => {
+          calls.push({ title, choices });
+          return undefined;
+        },
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].title).toBe("All tasks by project");
+    expect(calls[0].choices).toContain("── pi-tasks ──");
+    expect(calls[0].choices.some(choice => choice.includes("Review task flow"))).toBe(true);
   });
 
   it("reports unavailable subagent execution through the adapter-backed tool path", async () => {
@@ -135,13 +158,13 @@ describe("PiTasksHarness scenarios", () => {
     expect(h.subagents?.stopped).toEqual(["agent-1"]);
 
     await h.expectTask("1", {
-      status: "completed",
+      status: "pending",
       execution: { status: "stopped", agentId: "agent-1" },
     });
 
     await h.subagentStopped("agent-1", "partial");
     await h.expectTask("1", {
-      status: "completed",
+      status: "pending",
       execution: { status: "stopped", agentId: "agent-1", result: "partial" },
     });
     await h.expectInvariants();

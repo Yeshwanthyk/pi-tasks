@@ -17,10 +17,12 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
+import { projectLabel, resolveProjectIdentity } from "./project-identity.js";
+import { createPiTasksRuntime, runTaskEffect } from "./runtime.js";
 import { SubagentAdapter } from "./subagent-adapter.js";
 import { TaskExecution } from "./task-execution.js";
 import { TaskLifecycle } from "./task-lifecycle.js";
@@ -125,10 +127,12 @@ export default function (pi: ExtensionAPI) {
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
 
+  const runtime = createPiTasksRuntime();
   const subagents = new SubagentAdapter(pi.events, { debug });
 
   const taskExecution = new TaskExecution({
     getStore: () => store,
+    currentWorkspaceRoot: () => resolveProjectIdentity().root,
     spawnSubagent: (type, prompt, options) => subagents.spawn(type, prompt, options),
     stopSubagent: agentId => subagents.stop(agentId),
     writeOutput: writeTaskOutput,
@@ -154,8 +158,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Subagent completion listener ──
-  subagents.subscribe("subagents:completed", async (data) => {
-    await taskExecution.handleCompleted(data as { id: string; result?: string });
+  subagents.subscribe("subagents:completed", (data) => {
+    return runTaskEffect(runtime, taskExecution.handleCompleted(data as { id: string; result?: string })).catch(error => {
+      debug("completion handler failed", error);
+    });
   });
 
   subagents.subscribe("subagents:failed", (data) => {
@@ -235,6 +241,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     widget.dispose();
+    await runtime.dispose();
   });
 
   // ── System-reminder injection via tool_result event ──
@@ -391,9 +398,17 @@ All tasks are created with status \`pending\`.
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
     }),
 
-    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const meta = params.metadata ?? {};
-      const task = taskLifecycle.create(params.subject, params.description, params.activeForm, Object.keys(meta).length > 0 ? meta : undefined, params.agentType);
+      const task = taskLifecycle.create(
+        params.subject,
+        params.description,
+        params.activeForm,
+        Object.keys(meta).length > 0 ? meta : undefined,
+        params.agentType,
+        resolveProjectIdentity(),
+        ctx.sessionManager?.getSessionId(),
+      );
       return Promise.resolve(textResult(`Task #${task.id} created successfully: ${task.subject}`));
     },
   });
@@ -442,6 +457,9 @@ Use TaskGet with a specific task ID to view full details including description a
       const lines = sorted.map(task => {
         let line = `#${task.id} [${task.status}] ${task.subject}`;
 
+        if (task.project) {
+          line += " {" + projectLabel(task.project) + "}";
+        }
         if (task.owner) {
           line += ` (${task.owner})`;
         }
@@ -507,6 +525,13 @@ Returns full task details:
       if (task.owner) {
         lines.push(`Owner: ${task.owner}`);
       }
+      if (task.project) {
+        lines.push("Project: " + task.project.name);
+        lines.push("Workspace: " + task.project.root);
+        if (task.project.remote) lines.push("Remote: " + task.project.remote);
+        if (task.project.branch) lines.push("Branch: " + task.project.branch);
+      }
+      if (task.sessionId) lines.push("Origin session: " + task.sessionId);
       lines.push(`Description: ${desc}`);
 
       if (task.blockedBy.length > 0) {
@@ -640,11 +665,11 @@ Set up task dependencies:
       if (changedFields.length === 0 && !task) {
         return Promise.resolve(textResult(`Task #${taskId} not found`));
       }
+      if (warnings.length > 0) {
+        return Promise.resolve(textResult("Task #" + taskId + " update rejected: " + warnings.join("; ")));
+      }
 
       let msg = `Updated task #${taskId} ${changedFields.join(", ")}`;
-      if (warnings.length > 0) {
-        msg += ` (warning: ${warnings.join("; ")})`;
-      }
       return Promise.resolve(textResult(msg));
     },
   });
@@ -712,7 +737,10 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
       const processOutput = tracker.getOutput(task_id);
       if (!processOutput) {
-        const output = await taskExecution.output(task_id, block, timeout ?? 30000, signal ?? undefined);
+        const output = await runTaskEffect(runtime, taskExecution.output(task_id, block, timeout ?? 30000), {
+          signal: signal ?? undefined,
+          interruptMessage: "Task output wait aborted. The task keeps running.",
+        });
         if (!output) {
           if (!store.get(task_id)) throw new Error(`No task found with ID ${task_id}`);
           throw new Error(`No background process for task ${task_id}`);
@@ -762,12 +790,12 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
       const stopped = await tracker.stop(taskId);
       if (!stopped) {
-        const subagentStopped = await taskExecution.stop(taskId);
+        const subagentStopped = await runTaskEffect(runtime, taskExecution.stop(taskId));
         if (subagentStopped.stopped) return textResult(`Task #${taskId} stopped successfully`);
         throw new Error(`No running background process for task ${taskId}`);
       }
 
-      taskLifecycle.markCompleted(taskId);
+      taskLifecycle.update(taskId, { status: "pending" });
       return textResult(`Task #${taskId} stopped successfully`);
     },
   });
@@ -817,7 +845,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         maxTurns: params.max_turns,
       };
 
-      const summary = await taskExecution.executeTasks(params.task_ids, cascadeConfig);
+      const summary = await runTaskEffect(runtime, taskExecution.executeTasks(params.task_ids, cascadeConfig));
 
       const lines: string[] = [];
       if (summary.launched.length > 0) {
@@ -839,7 +867,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
   pi.registerCommand("tasks", {
     description: "Manage tasks — view, create, clear completed",
-    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       const ui = ctx.ui;
 
       const mainMenu = async (): Promise<void> => {
@@ -946,11 +974,50 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
         const description = await ui.input("Task description");
         if (!description) return mainMenu();
 
-        taskLifecycle.create(subject, description);
+        taskLifecycle.create(
+          subject,
+          description,
+          undefined,
+          undefined,
+          undefined,
+          resolveProjectIdentity(),
+          ctx.sessionManager.getSessionId(),
+        );
         return mainMenu();
       };
 
-      await mainMenu();
+      const viewAllProjects = async (): Promise<void> => {
+        const tasks = store.list();
+        if (tasks.length === 0) {
+          await ui.select("No tasks", ["Close"]);
+          return;
+        }
+
+        const statusOrder: Record<string, number> = { pending: 0, in_progress: 1, completed: 2 };
+        const sorted = [...tasks].sort((a, b) => {
+          const projectOrder = projectLabel(a.project).localeCompare(projectLabel(b.project));
+          if (projectOrder !== 0) return projectOrder;
+          const stateOrder = statusOrder[a.status] - statusOrder[b.status];
+          return stateOrder !== 0 ? stateOrder : Number(a.id) - Number(b.id);
+        });
+
+        const choices: string[] = [];
+        let currentProject: string | undefined;
+        for (const task of sorted) {
+          const project = projectLabel(task.project);
+          if (project !== currentProject) {
+            choices.push("── " + project + " ──");
+            currentProject = project;
+          }
+          const icon = task.status === "completed" ? "✔" : task.status === "in_progress" ? "◼" : "◻";
+          choices.push("  " + icon + " #" + task.id + " [" + task.status + "] " + task.subject);
+        }
+        choices.push("Close");
+        await ui.select("All tasks by project", choices);
+      };
+
+      if (args.trim() === "all") await viewAllProjects();
+      else await mainMenu();
     },
   });
 }

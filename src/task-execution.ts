@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { Clock, Effect, Result } from "effect";
+import type { SubagentRpcError } from "./effect-errors.js";
 import { boundedOutput, executionAgentId, openBlockers, terminalExecutionResult } from "./task-projections.js";
 import type { TaskStore } from "./task-store.js";
 import type { Task } from "./types.js";
@@ -11,8 +13,9 @@ export interface CascadeConfig {
 
 export interface TaskExecutionDeps {
   getStore(): TaskStore;
-  spawnSubagent(type: string, prompt: string, options?: unknown): Promise<string>;
-  stopSubagent(agentId: string): Promise<void>;
+  currentWorkspaceRoot(): string;
+  spawnSubagent(type: string, prompt: string, options?: unknown): Effect.Effect<string, SubagentRpcError>;
+  stopSubagent(agentId: string): Effect.Effect<void>;
   writeOutput(taskId: string, content: string | undefined): string | undefined;
   notify(message: string): void;
   taskNotification(taskId: string, status: string, summary: string, outputFile?: string): string;
@@ -77,11 +80,11 @@ export class TaskExecution {
     return prompt;
   }
 
-  findTaskForAgent(agentId: string, opts?: { allowCompleted?: boolean }): { taskId: string; executionId?: string } | undefined {
+  findTaskForAgent(agentId: string, opts?: { allowStopped?: boolean }): { taskId: string; executionId?: string } | undefined {
     const mapped = this.agentTaskMap.get(agentId);
     if (mapped) {
       const task = this.deps.getStore().get(mapped.taskId);
-      const statusMatches = task?.status === "in_progress" || (opts?.allowCompleted && task?.status === "completed");
+      const statusMatches = task?.status === "in_progress" || (opts?.allowStopped && task?.execution?.status === "stopped");
       if (statusMatches && task.execution?.executionId === mapped.executionId) return mapped;
       return undefined;
     }
@@ -89,111 +92,134 @@ export class TaskExecution {
       const execution = t.execution;
       const legacyAgentId = executionAgentId(t);
       return (execution?.agentId === agentId &&
-        (execution.status === "running" || execution.status === "stopping" || (opts?.allowCompleted && t.status === "completed"))) ||
+        (execution.status === "running" || execution.status === "stopping" || (opts?.allowStopped && execution.status === "stopped"))) ||
         (!execution && t.status === "in_progress" && legacyAgentId === agentId);
     });
     return task ? { taskId: task.id, executionId: task.execution?.executionId } : undefined;
   }
 
-  async executeTasks(taskIds: string[], options: ExecuteTasksOptions = {}): Promise<ExecutionSummary> {
-    const summary: ExecutionSummary = { launched: [], skipped: [] };
+  executeTasks(taskIds: string[], options: ExecuteTasksOptions = {}): Effect.Effect<ExecutionSummary> {
+    const self = this;
+    return Effect.gen(function* () {
+      const summary: ExecutionSummary = { launched: [], skipped: [] };
 
-    for (const taskId of taskIds) {
-      const task = this.deps.getStore().get(taskId);
-      if (!task) {
-        summary.skipped.push({ taskId, reason: "not found" });
-        continue;
+      for (const taskId of taskIds) {
+        const task = self.deps.getStore().get(taskId);
+        if (!task) {
+          summary.skipped.push({ taskId, reason: "not found" });
+          continue;
+        }
+        const launched = yield* self.launchTask(task, options);
+        if (launched.success) summary.launched.push({ taskId, agentId: launched.agentId });
+        else summary.skipped.push({ taskId, reason: launched.reason });
       }
-      const launched = await this.launchTask(task, options);
-      if (launched.success) summary.launched.push({ taskId, agentId: launched.agentId });
-      else summary.skipped.push({ taskId, reason: launched.reason });
-    }
 
-    this.deps.onTasksChanged();
-    return summary;
+      self.deps.onTasksChanged();
+      return summary;
+    });
   }
 
-  private async launchTask(task: Task, options: ExecuteTasksOptions): Promise<{ success: true; agentId: string } | { success: false; reason: string }> {
-    if (task.status !== "pending") return { success: false, reason: `not pending (status: ${task.status})` };
-    if (!task.agentType) return { success: false, reason: "no agentType set — create with agentType parameter" };
+  private launchTask(task: Task, options: ExecuteTasksOptions): Effect.Effect<{ success: true; agentId: string } | { success: false; reason: string }> {
+    const self = this;
+    return Effect.gen(function* () {
+      if (task.status !== "pending") return { success: false as const, reason: `not pending (status: ${task.status})` };
+      if (!task.agentType) return { success: false as const, reason: "no agentType set — create with agentType parameter" };
+      if (task.project && task.project.root !== self.deps.currentWorkspaceRoot()) {
+        return { success: false as const, reason: "belongs to workspace " + task.project.root };
+      }
 
-    const blockers = openBlockers(task, id => this.deps.getStore().get(id));
-    if (blockers.length > 0) return { success: false, reason: `blocked by ${blockers.map(id => "#" + id).join(", ")}` };
+      const blockers = openBlockers(task, id => self.deps.getStore().get(id));
+      if (blockers.length > 0) {
+        return { success: false as const, reason: `blocked by ${blockers.map(id => "#" + id).join(", ")}` };
+      }
 
-    const executionId = randomUUID();
-    const startedAt = Date.now();
-    this.deps.getStore().update(task.id, {
-      status: "in_progress",
-      execution: { status: "running", executionId, agentId: null, startedAt },
-    });
+      const executionId = randomUUID();
+      const startedAt = yield* Clock.currentTimeMillis;
+      self.deps.getStore().update(task.id, {
+        status: "in_progress",
+        execution: { status: "running", executionId, agentId: null, startedAt },
+      });
 
-    try {
-      const prompt = this.buildTaskPrompt(task, options.additionalContext);
-      const agentId = await this.deps.spawnSubagent(task.agentType, prompt, {
+      const prompt = self.buildTaskPrompt(task, options.additionalContext);
+      const spawned = yield* self.deps.spawnSubagent(task.agentType, prompt, {
         description: task.subject,
         isBackground: true,
         maxTurns: options.maxTurns,
         ...(options.model ? { model: options.model } : {}),
-      });
-      this.agentTaskMap.set(agentId, { taskId: task.id, executionId });
-      this.deps.getStore().update(task.id, {
+      }).pipe(Effect.result);
+
+      if (Result.isFailure(spawned)) {
+        const failedAt = yield* Clock.currentTimeMillis;
+        self.deps.getStore().update(task.id, {
+          status: "pending",
+          execution: {
+            status: "failed",
+            executionId,
+            agentId: null,
+            failedAt,
+            error: spawned.failure.message,
+          },
+        });
+        return { success: false as const, reason: `spawn failed — ${spawned.failure.message}` };
+      }
+
+      const agentId = spawned.success;
+      self.agentTaskMap.set(agentId, { taskId: task.id, executionId });
+      self.deps.getStore().update(task.id, {
         owner: agentId,
         execution: { status: "running", executionId, agentId, startedAt },
       });
-      this.deps.onTaskActivated(task.id, true);
-      return { success: true, agentId };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.deps.getStore().update(task.id, {
-        status: "pending",
-        execution: { status: "failed", executionId, agentId: null, failedAt: Date.now(), error: message },
-      });
-      return { success: false, reason: `spawn failed — ${message}` };
-    }
+      self.deps.onTaskActivated(task.id, true);
+      return { success: true as const, agentId };
+    });
   }
 
-  async handleCompleted(data: { id: string; result?: string }): Promise<void> {
-    const execution = this.findTaskForAgent(data.id);
-    if (!execution) return;
-    this.agentTaskMap.delete(data.id);
-    const task = this.deps.getStore().get(execution.taskId);
-    if (!task) return;
-    const executionId = task.execution?.executionId ?? randomUUID();
+  handleCompleted(data: { id: string; result?: string }): Effect.Effect<void> {
+    const self = this;
+    return Effect.gen(function* () {
+      const execution = self.findTaskForAgent(data.id);
+      if (!execution) return;
+      self.agentTaskMap.delete(data.id);
+      const task = self.deps.getStore().get(execution.taskId);
+      if (!task) return;
+      const executionId = task.execution?.executionId ?? randomUUID();
+      const completedAt = yield* Clock.currentTimeMillis;
 
-    const outputFile = this.deps.writeOutput(task.id, data.result);
-    this.deps.getStore().update(task.id, {
-      status: "completed",
-      execution: {
+      const outputFile = self.deps.writeOutput(task.id, data.result);
+      self.deps.getStore().update(task.id, {
         status: "completed",
-        executionId,
-        agentId: data.id,
-        completedAt: Date.now(),
-        result: data.result,
-        outputFile,
-      },
-    });
-    this.deps.notify(this.deps.taskNotification(task.id, "completed", `Task "${task.subject}" completed`, outputFile));
-    this.deps.onTaskActivated(task.id, false);
+        execution: {
+          status: "completed",
+          executionId,
+          agentId: data.id,
+          completedAt,
+          result: data.result,
+          outputFile,
+        },
+      });
+      self.deps.notify(self.deps.taskNotification(task.id, "completed", `Task "${task.subject}" completed`, outputFile));
+      self.deps.onTaskActivated(task.id, false);
 
-    if (this.deps.isAutoCascadeEnabled()) {
-      const cascadeConfig = this.deps.getCascadeConfig();
-      if (cascadeConfig) {
-        const unblocked = this.deps.getStore().list().filter(t =>
-          t.status === "pending" &&
-          t.agentType &&
-          t.blockedBy.includes(task.id) &&
-          t.blockedBy.every(depId => this.deps.getStore().get(depId)?.status === "completed")
-        );
-        for (const next of unblocked) await this.launchTask(next, cascadeConfig);
+      if (self.deps.isAutoCascadeEnabled()) {
+        const cascadeConfig = self.deps.getCascadeConfig();
+        if (cascadeConfig) {
+          const unblocked = self.deps.getStore().list().filter(t =>
+            t.status === "pending" &&
+            t.agentType &&
+            t.blockedBy.includes(task.id) &&
+            t.blockedBy.every(depId => self.deps.getStore().get(depId)?.status === "completed")
+          );
+          for (const next of unblocked) yield* self.launchTask(next, cascadeConfig);
+        }
       }
-    }
 
-    this.deps.onTaskCompleted(task.id);
-    this.deps.onTasksChanged();
+      self.deps.onTaskCompleted(task.id);
+      self.deps.onTasksChanged();
+    });
   }
 
   handleFailed(data: { id: string; error?: string; result?: string; status: string }): void {
-    const execution = this.findTaskForAgent(data.id, { allowCompleted: data.status === "stopped" });
+    const execution = this.findTaskForAgent(data.id, { allowStopped: data.status === "stopped" });
     if (!execution) return;
     this.agentTaskMap.delete(data.id);
     const task = this.deps.getStore().get(execution.taskId);
@@ -205,7 +231,7 @@ export class TaskExecution {
       const finalResult = data.result || (task.execution && (task.execution.status === "completed" || task.execution.status === "stopped") ? task.execution.result : undefined);
       const outputFile = this.deps.writeOutput(task.id, finalResult);
       this.deps.getStore().update(task.id, {
-        status: "completed",
+        status: "pending",
         execution: {
           status: "stopped",
           executionId,
@@ -216,7 +242,7 @@ export class TaskExecution {
         },
       });
       this.deps.notify(this.deps.taskNotification(task.id, "stopped", `Task "${task.subject}" was stopped`, outputFile));
-      if (!wasAlreadyStopped) this.deps.onTaskCompleted(task.id);
+      if (!wasAlreadyStopped) this.deps.onCascadeBlocked();
     } else {
       this.deps.getStore().update(task.id, {
         status: "pending",
@@ -235,87 +261,112 @@ export class TaskExecution {
     this.deps.onTasksChanged();
   }
 
-  async output(taskOrAgentId: string, block: boolean, timeout: number, signal?: AbortSignal): Promise<OutputResult | undefined> {
-    let resolvedId = taskOrAgentId;
-    if (!this.deps.getStore().get(resolvedId)) {
-      for (const [agentId, execution] of this.agentTaskMap) {
-        if (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId)) {
-          resolvedId = execution.taskId;
-          break;
+  output(taskOrAgentId: string, block: boolean, timeout: number): Effect.Effect<OutputResult | undefined> {
+    const self = this;
+    return Effect.gen(function* () {
+      let resolvedId = taskOrAgentId;
+      if (!self.deps.getStore().get(resolvedId)) {
+        for (const [agentId, execution] of self.agentTaskMap) {
+          if (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId)) {
+            resolvedId = execution.taskId;
+            break;
+          }
+        }
+        if (!self.deps.getStore().get(resolvedId)) {
+          const matched = self.deps.getStore().list().find(t => {
+            const agentId = executionAgentId(t);
+            return agentId && (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId));
+          });
+          if (matched) resolvedId = matched.id;
         }
       }
-      if (!this.deps.getStore().get(resolvedId)) {
-        const task = this.deps.getStore().list().find(t => {
-          const agentId = executionAgentId(t);
-          return agentId && (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId));
-        });
-        if (task) resolvedId = task.id;
+      let task = self.deps.getStore().get(resolvedId);
+      let agentId = executionAgentId(task);
+      if (!task || !agentId) return undefined;
+
+      if (block && task.status === "in_progress") {
+        const waitForSettlement = Effect.callback<void>((resume) => {
+          let settled = false;
+          let unsubOk = () => {};
+          let unsubFail = () => {};
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            unsubOk();
+            unsubFail();
+            resume(Effect.void);
+          };
+          unsubOk = self.deps.subscribeSubagentEvent("subagents:completed", d => {
+            if ((d as { id?: string }).id === agentId) finish();
+          });
+          unsubFail = self.deps.subscribeSubagentEvent("subagents:failed", d => {
+            if ((d as { id?: string }).id === agentId) finish();
+          });
+          const current = self.deps.getStore().get(resolvedId);
+          if (current && current.status !== "in_progress") finish();
+          return Effect.sync(() => {
+            unsubOk();
+            unsubFail();
+          });
+        }).pipe(Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.void }));
+        yield* waitForSettlement;
+        task = self.deps.getStore().get(resolvedId) ?? task;
+        agentId = executionAgentId(task) ?? agentId;
       }
-    }
-    let task = this.deps.getStore().get(resolvedId);
-    let agentId = executionAgentId(task);
-    if (!task || !agentId) return undefined;
 
-    if (block && task.status === "in_progress") {
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          unsubOk();
-          unsubFail();
-          resolve();
-        };
-        const timer = setTimeout(finish, timeout);
-        const unsubOk = this.deps.subscribeSubagentEvent("subagents:completed", d => {
-          if ((d as { id?: string }).id === agentId) finish();
-        });
-        const unsubFail = this.deps.subscribeSubagentEvent("subagents:failed", d => {
-          if ((d as { id?: string }).id === agentId) finish();
-        });
-        const current = this.deps.getStore().get(resolvedId);
-        if (current && current.status !== "in_progress") finish();
-        signal?.addEventListener("abort", finish, { once: true });
-      });
-      task = this.deps.getStore().get(resolvedId) ?? task;
-      agentId = executionAgentId(task) ?? agentId;
-    }
-
-    const { result: rawResult, outputFile } = terminalExecutionResult(task.execution);
-    const result = rawResult === undefined ? undefined : boundedOutput(rawResult);
-    return { taskId: resolvedId, status: task.status, agentId, result, outputFile };
+      const { result: rawResult, outputFile } = terminalExecutionResult(task.execution);
+      const result = rawResult === undefined ? undefined : boundedOutput(rawResult);
+      return { taskId: resolvedId, status: task.status, agentId, result, outputFile };
+    });
   }
 
-  async stop(taskOrAgentId: string): Promise<{ stopped: true; taskId: string } | { stopped: false }> {
-    let resolvedId = taskOrAgentId;
-    if (!this.deps.getStore().get(resolvedId)) {
-      for (const [agentId, execution] of this.agentTaskMap) {
-        if (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId)) {
-          resolvedId = execution.taskId;
-          break;
+  stop(taskOrAgentId: string): Effect.Effect<{ stopped: true; taskId: string } | { stopped: false }> {
+    const self = this;
+    return Effect.gen(function* () {
+      let resolvedId = taskOrAgentId;
+      if (!self.deps.getStore().get(resolvedId)) {
+        for (const [agentId, execution] of self.agentTaskMap) {
+          if (agentId === taskOrAgentId || agentId.startsWith(taskOrAgentId)) {
+            resolvedId = execution.taskId;
+            break;
+          }
         }
       }
-    }
-    const task = this.deps.getStore().get(resolvedId);
-    const agentId = executionAgentId(task);
-    if (!task || !agentId || task.status !== "in_progress") return { stopped: false };
+      const task = self.deps.getStore().get(resolvedId);
+      const agentId = executionAgentId(task);
+      if (!task || !agentId || task.status !== "in_progress") return { stopped: false as const };
 
-    const execution = task.execution;
-    const executionId = execution?.executionId ?? randomUUID();
-    this.deps.getStore().update(resolvedId, {
-      status: "completed",
-      execution: {
-        status: "stopped",
-        executionId,
-        agentId,
-        stoppedAt: Date.now(),
-      },
+      const execution = task.execution;
+      const executionId = execution?.executionId ?? randomUUID();
+      const stopRequestedAt = yield* Clock.currentTimeMillis;
+      self.deps.getStore().update(resolvedId, {
+        status: "in_progress",
+        execution: {
+          status: "stopping",
+          executionId,
+          agentId,
+          stopRequestedAt,
+        },
+      });
+      yield* self.deps.stopSubagent(agentId);
+      self.agentTaskMap.delete(agentId);
+      const current = self.deps.getStore().get(resolvedId);
+      if (current?.execution?.executionId === executionId && current.execution.status === "stopping") {
+        const stoppedAt = yield* Clock.currentTimeMillis;
+        self.deps.getStore().update(resolvedId, {
+          status: "pending",
+          execution: {
+            status: "stopped",
+            executionId,
+            agentId,
+            stoppedAt,
+          },
+        });
+      }
+      self.deps.onCascadeBlocked();
+      self.deps.onTaskActivated(resolvedId, false);
+      self.deps.onTasksChanged();
+      return { stopped: true as const, taskId: resolvedId };
     });
-    this.deps.onTaskCompleted(resolvedId);
-    await this.deps.stopSubagent(agentId);
-    this.deps.onTaskActivated(resolvedId, false);
-    this.deps.onTasksChanged();
-    return { stopped: true, taskId: resolvedId };
   }
 }

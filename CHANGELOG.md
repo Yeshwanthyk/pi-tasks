@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- New tasks capture project name, workspace root, git remote, branch, and originating session.
+- /tasks all renders a shared named list grouped by project.
+- Effect Schema validation for persisted task stores and extension settings.
+
+### Changed
+- Task execution, subagent RPC timeouts, output waits, cancellation, and clocks now run on one session-scoped Effect v4 managed runtime.
+- TypeScript validation now uses Effect TSGO with the Effect language-service plugin.
+- Task and execution lifecycles are explicitly separate. Stopped subagent and shell runs now leave tasks pending; only successful completion marks a task completed.
+- TaskExecute refuses tasks recorded in a different workspace, keeping shared cross-project lists visibility-only.
+- Dependency updates reject cycles, self-dependencies, and missing task references atomically.
+- Pi SDK dependencies now use the @earendil-works/pi-coding-agent and @earendil-works/pi-tui 0.80.7 packages.
+- The default test command disables file-level parallelism to avoid shared process-output fixture races.
+
 ## [0.5.0] - 2026-04-28
 
 ### Changed
