@@ -73,7 +73,7 @@ function taskNotification(taskId: string, status: string, summary: string, outpu
 /** Task tool names — used to detect task tool usage for reminder suppression. */
 const TASK_TOOL_NAMES = new Set(["TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "TaskClaim", "TaskOutput", "TaskStop", "TaskExecute"]);
 
-/** How many turns without task tool usage before injecting a reminder. */
+/** How many submitted requests without task tool usage before injecting a reminder. */
 const REMINDER_INTERVAL = 4;
 
 /** How many turns completed tasks linger before auto-clearing. */
@@ -106,6 +106,10 @@ export default function (pi: ExtensionAPI) {
   // For project scope (or env override), create store immediately.
   // For session scope, start with in-memory and upgrade once we have the session ID.
   let store = new TaskStore(resolveStorePath());
+  const isDefaultSessionStore = taskScope === "session" && piTasks === undefined;
+  const deleteDefaultSessionFileIfEmpty = () => {
+    if (isDefaultSessionStore) store.deleteFileIfEmpty();
+  };
   const openBlockersForTask = (task: Pick<Task, "blockedBy">): string[] => openExistingBlockers(task, id => store.get(id));
 
   // ── Subagent/task execution state ──
@@ -152,7 +156,10 @@ export default function (pi: ExtensionAPI) {
     getStore: () => store,
     currentTurn: () => currentTurn,
     onTaskActivated: (taskId, active = true) => widget.setActiveTask(taskId, active),
-    onTasksChanged: () => widget.update(),
+    onTasksChanged: () => {
+      deleteDefaultSessionFileIfEmpty();
+      widget.update();
+    },
     onTaskCompleted: (taskId, turn) => autoClear.trackCompletion(taskId, turn),
     onBatchCountdownReset: () => autoClear.resetBatchCountdown(),
   });
@@ -189,30 +196,36 @@ export default function (pi: ExtensionAPI) {
    *  On new sessions, auto-clear if all tasks are completed (clean slate).
    *  On resume, always show tasks (user may want to review).
    *  Only runs once — the first caller wins. */
-  function showPersistedTasks(isResume = false) {
+  function showPersistedTasks(isRestoration = true) {
     if (persistedTasksShown) return;
     persistedTasksShown = true;
     const tasks = store.list();
     if (tasks.length > 0) {
-      if (!isResume && tasks.every(t => t.status === "completed")) {
+      if (!isRestoration && isDefaultSessionStore && tasks.every(t => t.status === "completed")) {
         store.clearCompleted();
-        if (taskScope === "session") store.deleteFileIfEmpty();
+        deleteDefaultSessionFileIfEmpty();
       } else {
+        autoClear.rehydrate(currentTurn);
         widget.update();
       }
     }
   }
 
-  // ── Turn tracking for system-reminder injection ──
+  // ── Request tracking for system-reminder injection ──
   let currentTurn = 0;
-  let lastTaskToolUseTurn = 0;
-  let reminderInjectedThisCycle = false;
+  let currentRequest = 0;
+  let lastReminderBaselineRequest = 0;
+  let taskToolUsedForRequest: number | null = null;
+  let reminderInjectedForRequest: number | null = null;
 
   pi.on("turn_start", async (_event, ctx) => {
     currentTurn++;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
-    if (autoClear.onTurnStart(currentTurn)) widget.update();
+    if (autoClear.onTurnStart(currentTurn)) {
+      deleteDefaultSessionFileIfEmpty();
+      widget.update();
+    }
   });
 
   // ── Token usage tracking ──
@@ -244,39 +257,46 @@ export default function (pi: ExtensionAPI) {
     await runtime.dispose();
   });
 
+  // Pi preflights sibling calls before parallel execution, so record task-tool
+  // use here rather than waiting for completion-order tool_result events.
+  pi.on("tool_call", async (event) => {
+    if (!TASK_TOOL_NAMES.has(event.toolName)) return;
+    taskToolUsedForRequest = currentRequest;
+    lastReminderBaselineRequest = currentRequest;
+    reminderInjectedForRequest = null;
+  });
+
   // ── System-reminder injection via tool_result event ──
-  // Appends a <system-reminder> nudge to non-task tool results when tasks exist
-  // but task tools haven't been used recently (mimics Claude Code's behavior).
+  // Appends a <system-reminder> nudge to non-task tool results when actionable
+  // tasks exist but task tools haven't been used in recent submitted requests.
   pi.on("tool_result", async (event) => {
     const extraContent: Array<{ type: "text"; text: string }> = [];
     if (pendingTaskNotifications.length > 0) {
       extraContent.push({ type: "text", text: pendingTaskNotifications.splice(0).join("\n\n") });
     }
 
-    // Task tool usage resets the reminder timer, but still drains queued task notifications.
-    if (TASK_TOOL_NAMES.has(event.toolName)) {
-      lastTaskToolUseTurn = currentTurn;
-      reminderInjectedThisCycle = false;
+    // Task results still drain queued notifications. Reminder suppression was
+    // already recorded during preflight, before any sibling could complete.
+    if (TASK_TOOL_NAMES.has(event.toolName) || taskToolUsedForRequest === currentRequest) {
       return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
     }
 
-    // Cheap checks first — avoid store.list() disk I/O when possible
-    if (currentTurn - lastTaskToolUseTurn < REMINDER_INTERVAL) {
+    // Cheap checks first — avoid store.list() disk I/O when possible.
+    if (currentRequest - lastReminderBaselineRequest < REMINDER_INTERVAL) {
       return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
     }
-    if (reminderInjectedThisCycle) {
+    if (reminderInjectedForRequest === currentRequest) {
       return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
     }
 
     const tasks = store.list();
-    if (tasks.length === 0) {
+    if (!tasks.some(task => task.status === "pending" || task.status === "in_progress")) {
       return extraContent.length > 0 ? { content: [...event.content, ...extraContent] } : {};
     }
 
-    // Append system-reminder to tool result content.
-    // Reset the baseline so the next reminder fires REMINDER_INTERVAL turns later.
-    reminderInjectedThisCycle = true;
-    lastTaskToolUseTurn = currentTurn;
+    // Append system-reminder and use this request as the next cadence baseline.
+    reminderInjectedForRequest = currentRequest;
+    lastReminderBaselineRequest = currentRequest;
     return {
       content: [...event.content, ...extraContent, { type: "text" as const, text: SYSTEM_REMINDER }],
     };
@@ -285,6 +305,7 @@ export default function (pi: ExtensionAPI) {
   // Grab UI context early — before_agent_start fires before any tool calls,
   // so persisted tasks show up immediately on session start.
   pi.on("before_agent_start", async (_event, ctx) => {
+    currentRequest++;
     widget.setUICtx(ctx.ui as UICtx);
     upgradeStoreIfNeeded(ctx);
     showPersistedTasks();
@@ -294,14 +315,16 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  function resetSessionRuntime(reason: string | undefined, ctx: ExtensionContext, opts?: { startupResume?: boolean }) {
+  function resetSessionRuntime(reason: string | undefined, ctx: ExtensionContext) {
     widget.setUICtx(ctx.ui as UICtx);
 
     storeUpgraded = false;
     persistedTasksShown = false;
     currentTurn = 0;
-    lastTaskToolUseTurn = 0;
-    reminderInjectedThisCycle = false;
+    currentRequest = 0;
+    lastReminderBaselineRequest = 0;
+    taskToolUsedForRequest = null;
+    reminderInjectedForRequest = null;
     autoClear.reset();
     widget.resetRuntimeState();
 
@@ -311,19 +334,19 @@ export default function (pi: ExtensionAPI) {
     }
 
     upgradeStoreIfNeeded(ctx);
-    showPersistedTasks(reason === "resume" || opts?.startupResume === true);
+    showPersistedTasks(reason !== "new");
   }
 
   // Current pi emits session_start; older versions emitted session_switch.
   pi.on("session_start", async (event, ctx) => {
     const reason = event.reason as string | undefined;
-    const isReplacement = reason === "new" || reason === "resume" || reason === "fork";
-    const isStartupResume = reason === "startup" && ctx.sessionManager.getEntries().some(e => e.type === "message");
-    if (!isReplacement && !isStartupResume) {
+    const isSessionStart = reason === "startup" || reason === "reload" || reason === "new" ||
+      reason === "resume" || reason === "fork";
+    if (!isSessionStart) {
       widget.setUICtx(ctx.ui as UICtx);
       return;
     }
-    resetSessionRuntime(reason, ctx, { startupResume: isStartupResume });
+    resetSessionRuntime(reason, ctx);
   });
 
   (pi.on as (event: string, handler: (event: { reason?: string }, ctx: ExtensionContext) => Promise<void>) => void)("session_switch", async (event, ctx) => {
@@ -894,12 +917,12 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
           await settingsMenu();
         } else if (choice.startsWith("Clear completed")) {
           store.clearCompleted();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          deleteDefaultSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         } else if (choice.startsWith("Clear all")) {
           store.clearAll();
-          if (taskScope === "session") store.deleteFileIfEmpty();
+          deleteDefaultSessionFileIfEmpty();
           widget.update();
           await mainMenu();
         }
@@ -966,7 +989,9 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
       };
 
       const settingsMenu = (): Promise<void> =>
-        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY);
+        openSettingsMenu(ui, cfg, mainMenu, AUTO_CLEAR_DELAY, (previousMode, currentMode) => {
+          autoClear.onModeChanged(previousMode, currentMode, currentTurn);
+        });
 
       const createTask = async (): Promise<void> => {
         const subject = await ui.input("Task subject");

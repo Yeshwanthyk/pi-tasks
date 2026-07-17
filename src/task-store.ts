@@ -92,6 +92,7 @@ export class TaskStore {
 
     const diskHighWaterMark = this.readHighWaterMark();
     if (!existsSync(this.filePath)) {
+      this.tasks.clear();
       this.highWaterMark = Math.max(this.highWaterMark, diskHighWaterMark);
       this.nextId = Math.max(this.nextId, this.highWaterMark + 1);
       return;
@@ -226,7 +227,7 @@ export class TaskStore {
         return { task: undefined, changedFields: ["deleted"], warnings: [] };
       }
 
-      if (fields.status !== undefined) {
+      if (fields.status !== undefined && task.status !== fields.status) {
         task.status = fields.status;
         changedFields.push("status");
       }
@@ -393,14 +394,23 @@ export class TaskStore {
     });
   }
 
-  /** Delete the backing file (if file-backed and empty). */
+  /** Delete the backing file (if file-backed and empty) without saving it again on lock release. */
   deleteFileIfEmpty(): boolean {
-    if (!this.filePath) return false;
-    return this.withLock(() => {
+    if (!this.filePath || !this.lockPath) return false;
+    acquireLock(this.lockPath);
+    try {
+      this.load();
       if (this.tasks.size > 0) return false;
-      try { unlinkSync(this.filePath!); } catch { /* ignore */ }
-      return true;
-    });
+      try {
+        unlinkSync(this.filePath);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+        return false;
+      }
+    } finally {
+      releaseLock(this.lockPath);
+    }
   }
 
   /** Remove all completed tasks. */

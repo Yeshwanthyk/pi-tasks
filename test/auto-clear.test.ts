@@ -234,6 +234,106 @@ describe("auto-clear: dynamic mode switching", () => {
     manager.onTurnStart(9);
     expect(store.get("1")).toBeUndefined();
   });
+
+  it("rehydrates persisted completions when switching from never to automatic", () => {
+    const store = new TaskStore();
+    let mode: AutoClearMode = "never";
+    const manager = new AutoClearManager(() => store, () => mode);
+    store.create("Persisted", "Desc");
+    store.update("1", { status: "completed" });
+
+    mode = "on_task_complete";
+    manager.onModeChanged("never", mode, 10);
+
+    expect(manager.onTurnStart(13)).toBe(false);
+    expect(manager.onTurnStart(14)).toBe(true);
+    expect(store.get("1")).toBeUndefined();
+  });
+
+  it.each([
+    ["on_task_complete", "on_list_complete"],
+    ["on_list_complete", "on_task_complete"],
+  ] as const)("rehydrates when switching from %s to %s", (previousMode, currentMode) => {
+    const store = new TaskStore();
+    let mode: AutoClearMode = previousMode;
+    const manager = new AutoClearManager(() => store, () => mode);
+    store.create("Done", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+
+    mode = currentMode;
+    manager.onModeChanged(previousMode, currentMode, 10);
+
+    expect(manager.onTurnStart(13)).toBe(false);
+    expect(manager.onTurnStart(14)).toBe(true);
+    expect(store.get("1")).toBeUndefined();
+  });
+
+  it("resets tracking when switching to never", () => {
+    const store = new TaskStore();
+    let mode: AutoClearMode = "on_task_complete";
+    const manager = new AutoClearManager(() => store, () => mode);
+    store.create("Done", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+
+    mode = "never";
+    manager.onModeChanged("on_task_complete", mode, 2);
+    mode = "on_task_complete";
+
+    expect(manager.onTurnStart(10)).toBe(false);
+    expect(store.get("1")).toBeDefined();
+  });
+});
+
+describe("auto-clear: persisted-state rehydration", () => {
+  it("enrolls every completed task in on_task_complete mode", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_task_complete");
+    store.create("Done A", "Desc");
+    store.create("Pending", "Desc");
+    store.create("Done B", "Desc");
+    store.update("1", { status: "completed" });
+    store.update("3", { status: "completed" });
+
+    manager.rehydrate(2);
+    manager.onTurnStart(6);
+
+    expect(store.get("1")).toBeUndefined();
+    expect(store.get("2")?.status).toBe("pending");
+    expect(store.get("3")).toBeUndefined();
+  });
+
+  it("enrolls only a non-empty all-completed batch in on_list_complete mode", () => {
+    const emptyStore = new TaskStore();
+    const emptyManager = new AutoClearManager(() => emptyStore, () => "on_list_complete");
+    emptyManager.rehydrate(1);
+    expect(emptyManager.onTurnStart(5)).toBe(false);
+
+    const mixedStore = new TaskStore();
+    const mixedManager = new AutoClearManager(() => mixedStore, () => "on_list_complete");
+    mixedStore.create("Done", "Desc");
+    mixedStore.create("Pending", "Desc");
+    mixedStore.update("1", { status: "completed" });
+    mixedManager.rehydrate(1);
+    expect(mixedManager.onTurnStart(5)).toBe(false);
+    expect(mixedStore.list()).toHaveLength(2);
+
+    mixedStore.update("2", { status: "completed" });
+    mixedManager.rehydrate(5);
+    expect(mixedManager.onTurnStart(9)).toBe(true);
+  });
+
+  it("does nothing in never mode", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "never");
+    store.create("Done", "Desc");
+    store.update("1", { status: "completed" });
+
+    manager.rehydrate(1);
+    expect(manager.onTurnStart(100)).toBe(false);
+    expect(store.get("1")).toBeDefined();
+  });
 });
 
 describe("auto-clear: store getter (session switch)", () => {

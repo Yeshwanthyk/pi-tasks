@@ -43,10 +43,12 @@ export class TaskLifecycle {
 
   update(taskId: string, fields: TaskUpdateFields): { task: Task | undefined; changedFields: string[]; warnings: string[] } {
     const result = this.deps.getStore().update(taskId, fields);
-    if (result.task || result.changedFields.includes("deleted")) {
+    if (result.warnings.length > 0 || result.changedFields.length === 0) return result;
+
+    if (result.changedFields.includes("status") || result.changedFields.includes("deleted")) {
       this.applyStatusSideEffects(taskId, fields.status);
-      this.deps.onTasksChanged();
     }
+    this.deps.onTasksChanged();
     return result;
   }
 

@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -399,7 +399,7 @@ describe("TaskStore (file-backed)", () => {
 
   afterEach(() => {
     // Clean up test file
-    try { rmSync(filePath); } catch { /* */ }
+    try { rmSync(filePath, { recursive: true }); } catch { /* */ }
     try { rmSync(filePath + ".lock"); } catch { /* */ }
     try { rmSync(filePath + ".tmp"); } catch { /* */ }
     try { rmSync(filePath + ".highwatermark"); } catch { /* */ }
@@ -465,16 +465,63 @@ describe("TaskStore (file-backed)", () => {
     expect(t3.id).toBe("3");
   });
 
+  it("deletes an empty store without lock cleanup recreating it", () => {
+    const store = new TaskStore(testListId);
+    store.create("Task", "Desc");
+    store.clearAll();
+
+    expect(store.deleteFileIfEmpty()).toBe(true);
+    expect(existsSync(filePath)).toBe(false);
+    expect(existsSync(filePath + ".highwatermark")).toBe(true);
+    expect(readFileSync(filePath + ".highwatermark", "utf-8")).toBe("1");
+  });
+
   it("does not reuse IDs after deleting an empty session file", () => {
     const store1 = new TaskStore(testListId);
     store1.create("Task 1", "Desc");
     store1.create("Task 2", "Desc");
     store1.clearAll();
     expect(store1.deleteFileIfEmpty()).toBe(true);
+    expect(existsSync(filePath)).toBe(false);
 
     const store2 = new TaskStore(testListId);
     const t3 = store2.create("Task 3", "Desc");
     expect(t3.id).toBe("3");
+  });
+
+  it("does not delete a task created by another store around empty cleanup", () => {
+    const cleaner = new TaskStore(testListId);
+    cleaner.create("Old", "Desc");
+    cleaner.clearAll();
+
+    const creator = new TaskStore(testListId);
+    creator.create("Concurrent", "Desc");
+
+    expect(cleaner.deleteFileIfEmpty()).toBe(false);
+    expect(new TaskStore(testListId).list().map(task => task.subject)).toEqual(["Concurrent"]);
+  });
+
+  it("lets a stale second store create after empty cleanup without reviving deleted tasks", () => {
+    const cleaner = new TaskStore(testListId);
+    cleaner.create("Old", "Desc");
+    const creator = new TaskStore(testListId);
+
+    cleaner.clearAll();
+    expect(cleaner.deleteFileIfEmpty()).toBe(true);
+    expect(creator.create("Concurrent", "Desc").id).toBe("2");
+
+    expect(new TaskStore(testListId).list().map(task => task.subject)).toEqual(["Concurrent"]);
+  });
+
+  it("reports non-ENOENT unlink failures", () => {
+    const store = new TaskStore(testListId);
+    store.create("Task", "Desc");
+    store.clearAll();
+    rmSync(filePath);
+    mkdirSync(filePath);
+
+    expect(store.deleteFileIfEmpty()).toBe(false);
+    expect(existsSync(filePath)).toBe(true);
   });
 });
 

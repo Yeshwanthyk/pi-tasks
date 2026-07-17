@@ -26,6 +26,10 @@ export async function openSettingsMenu(
   cfg: TasksConfig,
   onBack: () => Promise<void>,
   clearDelayTurns: number,
+  onAutoClearModeChange?: (
+    previousMode: NonNullable<TasksConfig["autoClearCompleted"]>,
+    currentMode: NonNullable<TasksConfig["autoClearCompleted"]>,
+  ) => void,
 ): Promise<void> {
   await ui.custom((_tui, theme, _kb, done) => {
     const items: SettingItem[] = [
@@ -76,8 +80,11 @@ export async function openSettingsMenu(
           saveTasksConfig(cfg);
         }
         if (id === "autoClearCompleted") {
-          cfg.autoClearCompleted = newValue as TasksConfig["autoClearCompleted"];
+          const previousMode = cfg.autoClearCompleted ?? "on_list_complete";
+          const currentMode = newValue as NonNullable<TasksConfig["autoClearCompleted"]>;
+          cfg.autoClearCompleted = currentMode;
           saveTasksConfig(cfg);
+          onAutoClearModeChange?.(previousMode, currentMode);
         }
       },
       /* onCancel */ () => done(undefined),

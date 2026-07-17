@@ -1,5 +1,6 @@
 import { rmSync } from "node:fs";
 import { join } from "node:path";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { expect, vi } from "vitest";
 import initExtension from "../../src/index.js";
 import type { Task, TaskExecutionState } from "../../src/types.js";
@@ -21,6 +22,11 @@ export interface HarnessOptions {
   subagents?: "available" | "missing";
   spawnError?: string;
   env?: Record<string, string>;
+  useDefaultSessionStore?: boolean;
+  sessionId?: string;
+  sessionEntries?: unknown[];
+  selectResponses?: Array<string | undefined>;
+  settingsModeChanges?: Array<"never" | "on_list_complete" | "on_task_complete">;
 }
 
 interface UIMockState {
@@ -29,7 +35,8 @@ interface UIMockState {
   notifications: Array<{ message: string; level?: string }>;
 }
 
-function createUiMock(): { ctx: UICtx & { notify: ReturnType<typeof vi.fn> }; state: UIMockState } {
+function createUiMock(options: HarnessOptions = {}): { ctx: UICtx & { notify: ReturnType<typeof vi.fn> }; state: UIMockState } {
+  initTheme("dark", false);
   const state: UIMockState = {
     widgets: new Map(),
     statuses: new Map(),
@@ -45,6 +52,21 @@ function createUiMock(): { ctx: UICtx & { notify: ReturnType<typeof vi.fn> }; st
     },
     notify: vi.fn((message: string, level?: string) => {
       state.notifications.push({ message, level });
+    }),
+    select: vi.fn(async () => options.selectResponses?.shift()),
+    input: vi.fn(async () => undefined),
+    custom: vi.fn(async (factory: (...args: unknown[]) => unknown) => {
+      let resolved = false;
+      const done = () => { resolved = true; };
+      const root = factory({}, mockTheme(), {}, done) as { children?: unknown[] };
+      const settingsList = root.children?.find(child =>
+        (child as { constructor?: { name?: string } }).constructor?.name === "SettingsList"
+      ) as { onChange?: (id: string, value: string) => void } | undefined;
+      for (const mode of options.settingsModeChanges ?? []) {
+        settingsList?.onChange?.("autoClearCompleted", mode);
+      }
+      if (!resolved) done();
+      return undefined;
     }),
   };
 
@@ -136,19 +158,23 @@ function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?
 export class PiTasksHarness {
   readonly tools: Map<string, any>;
   readonly commands: Map<string, any>;
-  readonly ui = createUiMock();
+  readonly ui: ReturnType<typeof createUiMock>;
   readonly subagents?: ReturnType<typeof installSubagentsMock>;
   private readonly pi: ReturnType<typeof createMockPi>["pi"];
   private readonly lifecycleHandlers: ReturnType<typeof createMockPi>["lifecycleHandlers"];
   private readonly oldEnv: Record<string, string | undefined>;
+  private readonly options: HarnessOptions;
 
   private constructor(mock: ReturnType<typeof createMockPi>, options: HarnessOptions) {
     this.pi = mock.pi;
     this.tools = mock.tools;
+    this.ui = createUiMock(options);
     this.commands = mock.commands;
     this.lifecycleHandlers = mock.lifecycleHandlers;
     this.oldEnv = { PI_TASKS: process.env.PI_TASKS };
-    process.env.PI_TASKS = options.env?.PI_TASKS ?? "off";
+    this.options = options;
+    if (options.useDefaultSessionStore) delete process.env.PI_TASKS;
+    else process.env.PI_TASKS = options.env?.PI_TASKS ?? "off";
 
     if (options.subagents !== "missing") {
       this.subagents = installSubagentsMock(this.pi, { spawnError: options.spawnError });
@@ -173,8 +199,8 @@ export class PiTasksHarness {
       model: { id: "test-model", name: "Test" },
       modelRegistry: {},
       sessionManager: {
-        getSessionId: () => "harness-session",
-        getEntries: () => [],
+        getSessionId: () => this.options.sessionId ?? "harness-session",
+        getEntries: () => this.options.sessionEntries ?? [],
       },
       ui: this.ui.ctx,
     };
@@ -186,10 +212,20 @@ export class PiTasksHarness {
     return tool.execute("harness-call", params, undefined, undefined, this.ctx());
   }
 
+  async command(name: string, args = ""): Promise<void> {
+    const command = this.commands.get(name);
+    if (!command) throw new Error(`Command ${name} not registered`);
+    await command.handler(args, this.ctx());
+  }
+
   async lifecycle(event: string, ...args: unknown[]): Promise<unknown[]> {
     const results: unknown[] = [];
     for (const h of this.lifecycleHandlers.get(event) ?? []) results.push(await h(...args));
     return results;
+  }
+
+  async toolCall(toolName: string, toolCallId = `harness-${toolName}`): Promise<unknown[]> {
+    return this.lifecycle("tool_call", { toolName, toolCallId, input: {} }, this.ctx());
   }
 
   emit(channel: string, data: unknown): void {

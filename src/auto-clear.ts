@@ -52,6 +52,28 @@ export class AutoClearManager {
     this.allCompletedAtTurn = null;
   }
 
+  /** Rebuild countdowns for completed tasks restored from persisted state. */
+  rehydrate(currentTurn: number): void {
+    this.reset();
+    const mode = this.getMode();
+    const tasks = this.getStore().list();
+
+    if (mode === "on_task_complete") {
+      for (const task of tasks) {
+        if (task.status === "completed") this.completedAtTurn.set(task.id, currentTurn);
+      }
+    } else if (mode === "on_list_complete" && tasks.length > 0 && tasks.every(task => task.status === "completed")) {
+      this.allCompletedAtTurn = currentTurn;
+    }
+  }
+
+  /** Reset stale mode-specific tracking and enroll tasks in the new mode. */
+  onModeChanged(previousMode: AutoClearMode, currentMode: AutoClearMode, currentTurn: number): void {
+    if (previousMode === currentMode) return;
+    if (currentMode === "never") this.reset();
+    else this.rehydrate(currentTurn);
+  }
+
   /** Reset all tracking state (e.g., on new session). */
   reset(): void {
     this.completedAtTurn.clear();

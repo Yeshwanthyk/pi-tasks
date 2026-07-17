@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 
 - **8 LLM-callable tools** — `TaskCreate`, `TaskList`, `TaskGet`, `TaskUpdate`, `TaskClaim`, `TaskOutput`, `TaskStop`, `TaskExecute` — matching Claude Code's task workflow plus Pi-specific atomic claiming
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status icons, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts
-- **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when task tools haven't been used recently (matches Claude Code's behavior exactly)
+- **System-reminder injection** — periodic `<system-reminder>` nudges appended to tool results when actionable tasks exist and task tools haven't been used for several submitted requests
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
 - **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with atomic rejection of cycles, self-dependencies, and dangling references
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
@@ -206,7 +206,7 @@ Task storage is controlled by the `taskScope` setting (`/tasks` → Settings →
 | `session` **(default)** | `<cwd>/.pi/tasks/tasks-<sessionId>.json` | Per-session file — isolated between sessions, survives resume |
 | `project` | `<cwd>/.pi/tasks/tasks.json` | Shared across all sessions in the project |
 
-On new session start, if all persisted tasks are completed they are auto-cleared for a clean slate. On session resume, all tasks (including completed) are shown so the user can review progress. Empty session files are automatically deleted when all tasks are cleared.
+On a genuinely new session, a completed-only default session store is auto-cleared for a clean slate. On session resume, all tasks (including completed) are restored and automatic cleanup countdowns restart. Empty default session files are automatically deleted when all tasks are cleared; named and explicit `PI_TASKS` stores remain on disk.
 
 ### Auto-clear completed tasks
 
