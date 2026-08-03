@@ -3,6 +3,8 @@
  */
 
 export type TaskStatus = "pending" | "in_progress" | "completed";
+export const TASK_HARNESSES = ["pi", "claude", "codex"] as const;
+export type TaskHarness = (typeof TASK_HARNESSES)[number];
 
 export interface TaskProject {
   name: string;
@@ -14,7 +16,7 @@ export interface TaskProject {
 export type TaskExecutionState =
   | { status: "running"; executionId: string; agentId: string | null; startedAt: number }
   | { status: "completed"; executionId: string; agentId: string; completedAt: number; result?: string; outputFile?: string }
-  | { status: "failed"; executionId: string; agentId: string | null; failedAt: number; error: string }
+  | { status: "failed"; executionId: string; agentId: string | null; failedAt: number; error: string; result?: string; outputFile?: string }
   | { status: "stopping"; executionId: string; agentId: string; stopRequestedAt: number }
   | { status: "stopped"; executionId: string; agentId: string; stoppedAt: number; result?: string; outputFile?: string };
 
@@ -25,7 +27,7 @@ export interface Task {
   status: TaskStatus;
   activeForm?: string;
   owner?: string;
-  agentType?: string;
+  harness?: TaskHarness;
   execution?: TaskExecutionState;
   project?: TaskProject;
   sessionId?: string;

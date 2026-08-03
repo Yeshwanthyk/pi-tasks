@@ -634,10 +634,10 @@
     const transitions = [
       { from: "none", to: "pending", trigger: "TaskCreate", note: "Creates Task with status pending.", cite: "task-store.ts:150-173" },
       { from: "pending", to: "in_progress", trigger: "TaskUpdate", note: "Manual start; widget active state is separate.", cite: "index.ts:718-727" },
-      { from: "pending", to: "in_progress + execution.running", trigger: "TaskExecute", note: "Only if pending, has agentType, and Blockers are complete.", cite: "task-execution.ts:120-149" },
-      { from: "in_progress + running", to: "completed + execution.completed", trigger: "subagents:completed", note: "Writes output, notifies, maybe cascades.", cite: "task-execution.ts:162-199" },
-      { from: "in_progress + running", to: "pending + execution.failed", trigger: "subagents:failed", note: "Retryable failure; resets Auto-Cascade batch countdown.", cite: "task-execution.ts:202-240" },
-      { from: "in_progress + running", to: "completed + execution.stopped", trigger: "TaskStop", note: "Marks stopped before/while asking subagent to stop.", cite: "task-execution.ts:297-327" },
+      { from: "pending", to: "in_progress + execution.running", trigger: "TaskExecute", note: "Only if pending, has a harness, and Blockers are complete.", cite: "task-execution.ts" },
+      { from: "in_progress + running", to: "completed + execution.completed", trigger: "settled: completed", note: "Requires matching correlation and agent IDs; writes output, notifies, maybe cascades.", cite: "task-execution.ts" },
+      { from: "in_progress + running", to: "pending + execution.failed", trigger: "settled: failed", note: "Retryable failure; resets Auto-Cascade batch countdown.", cite: "task-execution.ts" },
+      { from: "in_progress + running", to: "pending + execution.stopped", trigger: "TaskStop / settled: cancelled", note: "Cancels through pi-subagents and preserves partial output when it settles.", cite: "task-execution.ts" },
       { from: "any", to: "deleted", trigger: "TaskUpdate deleted", note: "Deletes record and removes Blocker edges.", cite: "task-store.ts:206-214" }
     ];
 
@@ -652,20 +652,20 @@
     const sequences = {
       execute: [
         ["Tool", "TaskExecute checks subagentsAvailable"],
-        ["TaskExecution", "loads Task and validates pending / agentType / Blockers"],
+        ["TaskExecution", "loads Task and validates pending / harness / Blockers"],
         ["Store", "status becomes in_progress; execution becomes running with agentId null"],
-        ["pi RPC", "spawn returns agent ID"],
+        ["pi-subagents v1", "spawn returns the correlated client snapshot"],
         ["Store", "owner becomes agent ID; execution.running gets agentId"]
       ],
       failure: [
         ["Tool", "TaskExecute starts launch"],
         ["Store", "Task temporarily becomes in_progress"],
-        ["pi RPC", "spawn throws or later emits failed"],
+        ["pi-subagents v1", "spawn fails or a matching failed settlement arrives"],
         ["TaskExecution", "captures error"],
         ["Store", "Task becomes pending; execution becomes failed"]
       ],
       cascade: [
-        ["Event", "subagents:completed arrives"],
+        ["Event", "a matching completed settlement arrives"],
         ["Store", "completed Task stores result and outputFile"],
         ["TaskExecution", "finds pending dependents whose Blockers are all completed"],
         ["TaskExecution", "launches each unblocked Subagent Task"],
@@ -696,12 +696,12 @@
     const scenarios = {
       happy: {
         title: "Happy path Subagent Task",
-        note: "A pending Task with an agentType and no open Blockers moves through running to completed.",
+        note: "A pending Task with a harness and no open Blockers moves through running to completed.",
         steps: [
           { log: "TaskCreate", task: { status: "pending", execution: "none", owner: "none", blockers: "none" } },
           { log: "TaskExecute validates and marks running", task: { status: "in_progress", execution: "running(agentId: null)", owner: "none", blockers: "none" } },
           { log: "spawn returns agent-1", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
-          { log: "subagents:completed writes result", task: { status: "completed", execution: "completed(result, outputFile)", owner: "agent-1", blockers: "none" } }
+          { log: "matching completed settlement writes result", task: { status: "completed", execution: "completed(result, outputFile)", owner: "agent-1", blockers: "none" } }
         ]
       },
       blocked: {
@@ -719,18 +719,18 @@
         note: "Failure preserves execution failure details but returns Task Status to pending.",
         steps: [
           { log: "TaskExecute starts", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
-          { log: "subagents:failed arrives", task: { status: "pending", execution: "failed(error)", owner: "agent-1", blockers: "none" } },
+          { log: "matching failed settlement arrives", task: { status: "pending", execution: "failed(error)", owner: "agent-1", blockers: "none" } },
           { log: "TaskExecute retry starts new execution", task: { status: "in_progress", execution: "running(agentId: agent-2)", owner: "agent-2", blockers: "none" } },
           { log: "retry completes", task: { status: "completed", execution: "completed(result)", owner: "agent-2", blockers: "none" } }
         ]
       },
       stopped: {
         title: "Intentional stop",
-        note: "Stop is terminal from the Task Status perspective, even if final output arrives later.",
+        note: "A stopped execution leaves the Task pending and retryable, even if partial output arrives later.",
         steps: [
           { log: "Task is running", task: { status: "in_progress", execution: "running(agentId: agent-1)", owner: "agent-1", blockers: "none" } },
-          { log: "TaskStop called", task: { status: "completed", execution: "stopped(no result yet)", owner: "agent-1", blockers: "none" } },
-          { log: "subagents:failed status stopped with partial result", task: { status: "completed", execution: "stopped(partial result, outputFile)", owner: "agent-1", blockers: "none" } }
+          { log: "TaskStop sends client cancellation", task: { status: "pending", execution: "stopped(no result yet)", owner: "agent-1", blockers: "none" } },
+          { log: "cancelled settlement carries partial result", task: { status: "pending", execution: "stopped(partial result, outputFile)", owner: "agent-1", blockers: "none" } }
         ]
       }
     };

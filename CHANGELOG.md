@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-08-03
+
+### Changed
+- Task execution now uses version 1 of the pi-subagents client protocol (`ping`, `spawn`, `cancel`, `list`, `ready`, and `settled`) with execution and agent correlation checks.
+- The public task API now uses the optional `harness` enum (`pi`, `claude`, or `codex`) instead of `agentType`. Persisted legacy agent types migrate to the `pi` harness on load.
+- `TaskExecute` now accepts `reasoning_effort` and no longer accepts `max_turns`.
+- Session-scoped running executions are synced through the list channel when pi-subagents is available; missing agents return to pending after reload.
+- Failed and cancelled agents retain partial output for TaskOutput and output files.
+- Active subagent tasks must be stopped before their status or harness can be changed manually.
 
 ## [0.5.1] - 2026-07-17
 

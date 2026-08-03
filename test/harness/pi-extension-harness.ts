@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { expect, vi } from "vitest";
 import initExtension from "../../src/index.js";
+import type { ReasoningEffort, SubagentHarness } from "../../src/subagent-adapter.js";
 import type { Task, TaskExecutionState } from "../../src/types.js";
 import type { Theme, UICtx } from "../../src/ui/task-widget.js";
 
@@ -13,9 +14,15 @@ export type MockEventBus = {
 
 export interface SpawnedSubagent {
   id: string;
-  type: string;
+  clientId: "pi-tasks";
+  correlationId: string;
+  harness: SubagentHarness;
+  name: string;
   prompt: string;
-  options: Record<string, unknown>;
+  cwd?: string;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  status: "running";
 }
 
 export interface HarnessOptions {
@@ -123,35 +130,56 @@ function installSubagentsMock(pi: { events: MockEventBus }, opts?: { spawnError?
   const spawned: SpawnedSubagent[] = [];
   const stopped: string[] = [];
 
-  const unsubPing = pi.events.on("subagents:rpc:ping", (data: unknown) => {
+  const unsubPing = pi.events.on("subagents:client:ping", (data: unknown) => {
     const { requestId } = data as { requestId: string };
-    pi.events.emit(`subagents:rpc:ping:reply:${requestId}`, { success: true, data: { version: 2 } });
+    pi.events.emit(`subagents:client:ping:reply:${requestId}`, {
+      success: true,
+      data: { version: 1, harnesses: ["pi", "claude", "codex"] },
+    });
   });
 
-  const unsubSpawn = pi.events.on("subagents:rpc:spawn", (data: unknown) => {
-    const { requestId, type, prompt, options } = data as {
-      requestId: string; type: string; prompt: string; options?: Record<string, unknown>;
-    };
+  const unsubSpawn = pi.events.on("subagents:client:spawn", (data: unknown) => {
+    const { requestId, ...request } = data as Omit<SpawnedSubagent, "id" | "status"> & { requestId: string };
     if (opts?.spawnError) {
-      pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: false, error: opts.spawnError });
+      pi.events.emit(`subagents:client:spawn:reply:${requestId}`, { success: false, error: opts.spawnError });
       return;
     }
-    const id = `agent-${++idCounter}`;
-    spawned.push({ id, type, prompt, options: options ?? {} });
-    pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: true, data: { id } });
+    const snapshot: SpawnedSubagent = { ...request, id: `agent-${++idCounter}`, status: "running" };
+    spawned.push(snapshot);
+    pi.events.emit(`subagents:client:spawn:reply:${requestId}`, {
+      success: true,
+      data: { ...snapshot, cwd: snapshot.cwd ?? process.cwd() },
+    });
   });
 
-  const unsubStop = pi.events.on("subagents:rpc:stop", (data: unknown) => {
+  const unsubCancel = pi.events.on("subagents:client:cancel", (data: unknown) => {
     const { requestId, agentId } = data as { requestId: string; agentId: string };
-    stopped.push(agentId);
-    pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, { success: true });
+    const snapshot = spawned.find(candidate => candidate.id === agentId);
+    if (snapshot) stopped.push(agentId);
+    pi.events.emit(`subagents:client:cancel:reply:${requestId}`, {
+      success: true,
+      data: {
+        id: agentId,
+        title: snapshot?.name ?? "?",
+        status: snapshot ? "error" : "done",
+        cancelled: snapshot !== undefined,
+      },
+    });
+  });
+
+  const unsubList = pi.events.on("subagents:client:list", (data: unknown) => {
+    const { requestId } = data as { requestId: string };
+    pi.events.emit(`subagents:client:list:reply:${requestId}`, {
+      success: true,
+      data: spawned.map(snapshot => ({ ...snapshot, cwd: snapshot.cwd ?? process.cwd() })),
+    });
   });
 
   return {
     spawned,
     stopped,
-    ready() { pi.events.emit("subagents:ready", {}); },
-    dispose() { unsubPing(); unsubSpawn(); unsubStop(); },
+    ready() { pi.events.emit("subagents:client:ready", { version: 1 }); },
+    dispose() { unsubPing(); unsubSpawn(); unsubCancel(); unsubList(); },
   };
 }
 
@@ -233,19 +261,31 @@ export class PiTasksHarness {
   }
 
   async subagentCompleted(agentId: string, result?: string): Promise<void> {
-    this.emit("subagents:completed", { id: agentId, result });
+    this.emitSettlement(agentId, "completed", { result });
     await this.flushEvents();
   }
 
-  async subagentFailed(agentId: string, error: string): Promise<void> {
-    this.emit("subagents:failed", { id: agentId, status: "failed", error });
+  async subagentFailed(agentId: string, error: string, result?: string): Promise<void> {
+    this.emitSettlement(agentId, "failed", { error, result });
     await this.flushEvents();
   }
 
-  /** The subagents extension reports intentional stops on its failed lifecycle channel. */
   async subagentStopped(agentId: string, result?: string): Promise<void> {
-    this.emit("subagents:failed", { id: agentId, status: "stopped", result });
+    this.emitSettlement(agentId, "cancelled", { result });
     await this.flushEvents();
+  }
+
+  private emitSettlement(agentId: string, outcome: "completed" | "failed" | "cancelled", fields: { result?: string; error?: string }): void {
+    const spawned = this.subagents?.spawned.find(candidate => candidate.id === agentId);
+    if (!spawned) throw new Error(`No spawned subagent ${agentId}`);
+    this.emit("subagents:client:settled", {
+      version: 1,
+      clientId: "pi-tasks",
+      correlationId: spawned.correlationId,
+      agentId,
+      outcome,
+      ...fields,
+    });
   }
 
   spawned(index = 0): SpawnedSubagent {
@@ -258,7 +298,7 @@ export class PiTasksHarness {
     const result = await this.tool("TaskGet", { taskId: id }) as { content: Array<{ text: string }> };
     const text = result.content[0]?.text ?? "";
     const status = text.match(/^Status: (.+)$/m)?.[1] as Task["status"] | undefined;
-    const agentType = text.match(/^Agent type: (.+)$/m)?.[1];
+    const harness = text.match(/^Harness: (.+)$/m)?.[1] as Task["harness"];
     const executionText = text.match(/^Execution: (.+)$/m)?.[1];
     const metadataText = text.match(/^Metadata: (.+)$/m)?.[1];
     return {
@@ -266,7 +306,7 @@ export class PiTasksHarness {
       subject: text.match(new RegExp(`^Task #${id}: (.+)$`, "m"))?.[1] ?? "",
       description: text.match(/^Description: (.+)$/m)?.[1] ?? "",
       status: status ?? "pending",
-      agentType,
+      harness,
       execution: executionText ? JSON.parse(executionText) as TaskExecutionState : undefined,
       metadata: metadataText ? JSON.parse(metadataText) as Record<string, unknown> : {},
       blocks: [],
@@ -276,10 +316,10 @@ export class PiTasksHarness {
     };
   }
 
-  async expectTask(id: string, expected: { status?: Task["status"]; agentType?: string; execution?: Partial<TaskExecutionState> }): Promise<void> {
+  async expectTask(id: string, expected: { status?: Task["status"]; harness?: Task["harness"]; execution?: Partial<TaskExecutionState> }): Promise<void> {
     const task = await this.task(id);
     if (expected.status) expect(task.status).toBe(expected.status);
-    if (expected.agentType) expect(task.agentType).toBe(expected.agentType);
+    if (expected.harness) expect(task.harness).toBe(expected.harness);
     if (expected.execution) expect(task.execution).toMatchObject(expected.execution);
   }
 

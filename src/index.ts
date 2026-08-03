@@ -9,7 +9,7 @@
  *   TaskClaim    — Atomically claim an available task
  *   TaskOutput   — Get output from a background task process
  *   TaskStop     — Stop a running background task process
- *   TaskExecute  — Execute tasks as subagents (requires pi-interactive-subagents)
+ *   TaskExecute  — Execute tasks through the optional pi-subagents client protocol
  *
  * Commands:
  *   /tasks       — Interactive task management menu
@@ -23,7 +23,7 @@ import { AutoClearManager } from "./auto-clear.js";
 import { ProcessTracker } from "./process-tracker.js";
 import { projectLabel, resolveProjectIdentity } from "./project-identity.js";
 import { createPiTasksRuntime, runTaskEffect } from "./runtime.js";
-import { SubagentAdapter } from "./subagent-adapter.js";
+import { REASONING_EFFORTS, SUBAGENT_HARNESSES, SubagentAdapter } from "./subagent-adapter.js";
 import { TaskExecution } from "./task-execution.js";
 import { TaskLifecycle } from "./task-lifecycle.js";
 import { boundedOutput, executionAgentId, openExistingBlockers } from "./task-projections.js";
@@ -129,7 +129,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Subagent integration state ──
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
-  let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
+  let cascadeConfig: { additionalContext?: string; model?: string; reasoningEffort?: typeof REASONING_EFFORTS[number] } | undefined;
 
   const runtime = createPiTasksRuntime();
   const subagents = new SubagentAdapter(pi.events, { debug });
@@ -137,8 +137,9 @@ export default function (pi: ExtensionAPI) {
   const taskExecution = new TaskExecution({
     getStore: () => store,
     currentWorkspaceRoot: () => resolveProjectIdentity().root,
-    spawnSubagent: (type, prompt, options) => subagents.spawn(type, prompt, options),
-    stopSubagent: agentId => subagents.stop(agentId),
+    spawnSubagent: request => subagents.spawn(request),
+    cancelSubagent: agentId => subagents.cancel(agentId),
+    listSubagents: subagents.list(),
     writeOutput: writeTaskOutput,
     notify: enqueueTaskNotification,
     taskNotification,
@@ -148,7 +149,7 @@ export default function (pi: ExtensionAPI) {
     onCascadeBlocked: () => autoClear.resetBatchCountdown(),
     isAutoCascadeEnabled: () => cfg.autoCascade ?? false,
     getCascadeConfig: () => cascadeConfig,
-    subscribeSubagentEvent: (event, handler) => subagents.subscribe(event, handler),
+    subscribeSettled: handler => subagents.subscribeSettled(handler),
   });
 
   const autoClear = new AutoClearManager(() => store, () => cfg.autoClearCompleted ?? "on_list_complete", AUTO_CLEAR_DELAY);
@@ -164,16 +165,28 @@ export default function (pi: ExtensionAPI) {
     onBatchCountdownReset: () => autoClear.resetBatchCountdown(),
   });
 
-  // ── Subagent completion listener ──
-  subagents.subscribe("subagents:completed", (data) => {
-    return runTaskEffect(runtime, taskExecution.handleCompleted(data as { id: string; result?: string })).catch(error => {
-      debug("completion handler failed", error);
+  // ── Subagent lifecycle and persisted execution reconciliation ──
+  subagents.subscribeSettled(data => {
+    void runTaskEffect(runtime, taskExecution.handleSettled(data)).catch(error => {
+      debug("settlement handler failed", error);
     });
   });
 
-  subagents.subscribe("subagents:failed", (data) => {
-    taskExecution.handleFailed(data as { id: string; error?: string; result?: string; status: string });
-  });
+  let runningSync: Promise<void> | undefined;
+  function syncRunningExecutions(): void {
+    if (!storeUpgraded || !subagents.isAvailable() || runningSync) return;
+    runningSync = runTaskEffect(runtime, taskExecution.syncRunning({
+      // Project stores can contain agents owned by another live Pi process.
+      markMissing: taskScope !== "project",
+    }))
+      .catch(error => {
+        debug("subagent sync failed", error);
+      })
+      .finally(() => {
+        runningSync = undefined;
+      });
+  }
+  subagents.onAvailable(syncRunningExecutions);
 
   // ── Session-scoped store upgrade ──
   // For session scope, the store starts in-memory (no session ID at init time).
@@ -190,6 +203,7 @@ export default function (pi: ExtensionAPI) {
       widget.setStore(store);
     }
     storeUpgraded = true;
+    syncRunningExecutions();
   }
 
   /** Restore widget on session start/resume if there's unfinished work.
@@ -253,6 +267,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    subagents.dispose();
     widget.dispose();
     await runtime.dispose();
   });
@@ -327,6 +342,7 @@ export default function (pi: ExtensionAPI) {
     reminderInjectedForRequest = null;
     autoClear.reset();
     widget.resetRuntimeState();
+    taskExecution.reset();
 
     // Memory mode has no file-backed store to switch — clear explicitly on /new
     if (reason === "new" && taskScope === "memory") {
@@ -407,7 +423,7 @@ All tasks are created with status \`pending\`.
 - Include enough detail in the description for another agent to understand and complete the task
 - After creating tasks, use TaskUpdate to set up dependencies (blocks/blockedBy) if needed
 - Check TaskList first to avoid creating duplicate tasks
-- Include \`agentType\` (e.g., "general-purpose", "Explore") to mark tasks for subagent execution via TaskExecute`,
+- Include \`harness\` (\`pi\`, \`claude\`, or \`codex\`) to make a task executable via TaskExecute`,
     promptGuidelines: [
       "When working on complex multi-step tasks, use TaskCreate to track progress and TaskUpdate to update status.",
       "Mark tasks as in_progress before starting work and completed when done.",
@@ -417,7 +433,7 @@ All tasks are created with status \`pending\`.
       subject: Type.String({ description: "A brief title for the task" }),
       description: Type.String({ description: "A detailed description of what needs to be done" }),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress (e.g., 'Running tests')" })),
-      agentType: Type.Optional(Type.String({ description: "Agent type for subagent execution (e.g., 'general-purpose', 'Explore'). Tasks with agentType can be started via TaskExecute." })),
+      harness: Type.Optional(Type.Union(SUBAGENT_HARNESSES.map(harness => Type.Literal(harness)), { description: "Harness used for subagent execution. Tasks with a harness can be started via TaskExecute." })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Arbitrary metadata to attach to the task" })),
     }),
 
@@ -428,7 +444,7 @@ All tasks are created with status \`pending\`.
         params.description,
         params.activeForm,
         Object.keys(meta).length > 0 ? meta : undefined,
-        params.agentType,
+        params.harness,
         resolveProjectIdentity(),
         ctx.sessionManager?.getSessionId(),
       );
@@ -567,7 +583,7 @@ Returns full task details:
         lines.push(`Blocks: ${task.blocks.map(id => "#" + id).join(", ")}`);
       }
 
-      if (task.agentType) lines.push(`Agent type: ${task.agentType}`);
+      if (task.harness) lines.push(`Harness: ${task.harness}`);
       if (task.execution) lines.push(`Execution: ${formatExecution(task.execution)}`);
 
       // Show metadata if non-empty
@@ -625,6 +641,7 @@ Returns full task details:
 - **description**: Change the task description
 - **activeForm**: Present continuous form shown in spinner when in_progress (e.g., "Running tests")
 - **owner**: Change the task owner (agent name)
+- **harness**: Set the execution harness (\`pi\`, \`claude\`, or \`codex\`), or null to clear it
 - **metadata**: Merge metadata keys into the task (set a key to null to delete it)
 - **addBlocks**: Mark tasks that cannot start until this one completes
 - **addBlockedBy**: Mark tasks that must complete before this one can start
@@ -676,6 +693,10 @@ Set up task dependencies:
       description: Type.Optional(Type.String({ description: "New description for the task" })),
       activeForm: Type.Optional(Type.String({ description: "Present continuous form shown in spinner when in_progress" })),
       owner: Type.Optional(Type.String({ description: "New owner for the task" })),
+      harness: Type.Optional(Type.Union([
+        ...SUBAGENT_HARNESSES.map(harness => Type.Literal(harness)),
+        Type.Null(),
+      ], { description: "Execution harness, or null to clear it" })),
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Metadata keys to merge into the task. Set a key to null to delete it." })),
       addBlocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that this task blocks" })),
       addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that block this task" })),
@@ -834,7 +855,7 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
 ## When to Use This Tool
 
-- To start execution of tasks that have \`agentType\` set (created via TaskCreate with agentType parameter)
+- To start execution of tasks that have \`harness\` set (created via TaskCreate or TaskUpdate)
 - Tasks must be \`pending\` with all blockedBy dependencies \`completed\`
 - Each task runs as an independent background subagent
 
@@ -842,8 +863,8 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
 
 - **task_ids**: Array of task IDs to execute
 - **additional_context**: Extra context appended to each agent's prompt
-- **model**: Model override for agents (e.g., "sonnet", "haiku")
-- **max_turns**: Maximum turns per agent`,
+- **model**: Model override for agents (interpreted by the selected harness)
+- **reasoning_effort**: Optional shared effort level (off, minimal, low, medium, high, xhigh, max)`,
     promptGuidelines: [
       "Never use the Agent tool for tasks launched via TaskExecute — agents are already running.",
     ],
@@ -851,21 +872,21 @@ If checkOwnerBusy is true, the claim also fails when the owner already has anoth
       task_ids: Type.Array(Type.String(), { description: "Task IDs to execute as subagents" }),
       additional_context: Type.Optional(Type.String({ description: "Extra context for agent prompts" })),
       model: Type.Optional(Type.String({ description: "Model override for agents" })),
-      max_turns: Type.Optional(Type.Number({ description: "Max turns per agent", minimum: 1 })),
+      reasoning_effort: Type.Optional(Type.Union(REASONING_EFFORTS.map(effort => Type.Literal(effort)), { description: "Reasoning effort override for agents" })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (!subagents.isAvailable()) {
         return textResult(
           "Subagent execution is currently unavailable. " +
-          "Ensure the pi-interactive-subagents extension is loaded and try again."
+          "Ensure the pi-subagents extension is loaded and try again."
         );
       }
 
       cascadeConfig = {
         additionalContext: params.additional_context,
         model: params.model,
-        maxTurns: params.max_turns,
+        reasoningEffort: params.reasoning_effort,
       };
 
       const summary = await runTaskEffect(runtime, taskExecution.executeTasks(params.task_ids, cascadeConfig));

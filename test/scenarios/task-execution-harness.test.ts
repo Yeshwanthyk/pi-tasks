@@ -15,17 +15,17 @@ describe("PiTasksHarness scenarios", () => {
     await h.tool("TaskCreate", {
       subject: "Review auth flow",
       description: "Find risks",
-      agentType: "Explore",
+      harness: "pi",
     });
 
     const execute = await h.tool("TaskExecute", { task_ids: ["1"] }) as { content: Array<{ text: string }> };
     expect(execute.content[0].text).toContain("#1 → agent agent-1");
-    expect(h.spawned()).toMatchObject({ type: "Explore" });
+    expect(h.spawned()).toMatchObject({ harness: "pi" });
     expect(h.spawned().prompt).toContain("Review auth flow");
 
     await h.expectTask("1", {
       status: "in_progress",
-      agentType: "Explore",
+      harness: "pi",
       execution: { status: "running", agentId: "agent-1" },
     });
 
@@ -44,7 +44,7 @@ describe("PiTasksHarness scenarios", () => {
     await h.tool("TaskCreate", {
       subject: "Try risky work",
       description: "May fail",
-      agentType: "general-purpose",
+      harness: "pi",
     });
     await h.tool("TaskExecute", { task_ids: ["1"] });
     await h.subagentFailed("agent-1", "boom");
@@ -55,7 +55,7 @@ describe("PiTasksHarness scenarios", () => {
     });
 
     await h.tool("TaskExecute", { task_ids: ["1"] });
-    expect(h.spawned(1)).toMatchObject({ id: "agent-2", type: "general-purpose" });
+    expect(h.spawned(1)).toMatchObject({ id: "agent-2", harness: "pi" });
     await h.expectTask("1", {
       status: "in_progress",
       execution: { status: "running", agentId: "agent-2" },
@@ -121,19 +121,19 @@ describe("PiTasksHarness scenarios", () => {
     await h.tool("TaskCreate", {
       subject: "Needs agent",
       description: "Should not start",
-      agentType: "general-purpose",
+      harness: "pi",
     });
 
     const execute = await h.tool("TaskExecute", { task_ids: ["1"] }) as { content: Array<{ text: string }> };
     expect(execute.content[0].text).toContain("Subagent execution is currently unavailable");
-    await h.expectTask("1", { status: "pending", agentType: "general-purpose" });
+    await h.expectTask("1", { status: "pending", harness: "pi" });
   });
 
   it("injects prerequisite results when executing an unblocked dependent task", async () => {
     h = PiTasksHarness.create();
 
-    await h.tool("TaskCreate", { subject: "A", description: "Produce", agentType: "general-purpose" });
-    await h.tool("TaskCreate", { subject: "B", description: "Consume", agentType: "general-purpose" });
+    await h.tool("TaskCreate", { subject: "A", description: "Produce", harness: "pi" });
+    await h.tool("TaskCreate", { subject: "B", description: "Consume", harness: "pi" });
     await h.tool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
 
     await h.tool("TaskExecute", { task_ids: ["1"] });
@@ -150,7 +150,7 @@ describe("PiTasksHarness scenarios", () => {
   it("stops a running subagent task through TaskStop", async () => {
     h = PiTasksHarness.create();
 
-    await h.tool("TaskCreate", { subject: "Stop me", description: "Long run", agentType: "general-purpose" });
+    await h.tool("TaskCreate", { subject: "Stop me", description: "Long run", harness: "pi" });
     await h.tool("TaskExecute", { task_ids: ["1"] });
 
     const stopped = await h.tool("TaskStop", { task_id: "1" }) as { content: Array<{ text: string }> };
@@ -174,7 +174,7 @@ describe("PiTasksHarness scenarios", () => {
     h = PiTasksHarness.create();
 
     await h.lifecycle("turn_start", {}, h.ctx());
-    await h.tool("TaskCreate", { subject: "Visible", description: "Render me", agentType: "general-purpose" });
+    await h.tool("TaskCreate", { subject: "Visible", description: "Render me", harness: "pi" });
     await h.tool("TaskExecute", { task_ids: ["1"] });
 
     const lines = h.renderWidget();

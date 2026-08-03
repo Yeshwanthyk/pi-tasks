@@ -12,7 +12,12 @@ export function executionAgentId(task: Pick<Task, "execution" | "metadata"> | un
 }
 
 export function terminalExecutionResult(execution: Task["execution"]): { result?: string; outputFile?: string } {
-  if (!execution || (execution.status !== "completed" && execution.status !== "stopped")) return {};
+  if (
+    !execution ||
+    (execution.status !== "completed" &&
+      execution.status !== "failed" &&
+      execution.status !== "stopped")
+  ) return {};
   return { result: execution.result, outputFile: execution.outputFile };
 }
 

@@ -1,5 +1,5 @@
 import type { TaskStore } from "./task-store.js";
-import type { Task, TaskProject, TaskStatus } from "./types.js";
+import type { Task, TaskHarness, TaskProject, TaskStatus } from "./types.js";
 
 export interface TaskLifecycleDeps {
   getStore(): TaskStore;
@@ -16,7 +16,7 @@ export interface TaskUpdateFields {
   description?: string;
   activeForm?: string;
   owner?: string;
-  agentType?: string;
+  harness?: TaskHarness | null;
   execution?: Task["execution"];
   metadata?: Record<string, unknown>;
   addBlocks?: string[];
@@ -31,17 +31,30 @@ export class TaskLifecycle {
     description: string,
     activeForm?: string,
     metadata?: Record<string, unknown>,
-    agentType?: string,
+    harness?: TaskHarness,
     project?: TaskProject,
     sessionId?: string,
   ): Task {
     this.deps.onBatchCountdownReset();
-    const task = this.deps.getStore().create(subject, description, activeForm, metadata, agentType, project, sessionId);
+    const task = this.deps.getStore().create(subject, description, activeForm, metadata, harness, project, sessionId);
     this.deps.onTasksChanged();
     return task;
   }
 
   update(taskId: string, fields: TaskUpdateFields): { task: Task | undefined; changedFields: string[]; warnings: string[] } {
+    const current = this.deps.getStore().get(taskId);
+    const active = current?.execution?.status === "running" || current?.execution?.status === "stopping";
+    if (active) {
+      const warnings: string[] = [];
+      if (fields.status !== undefined && fields.status !== "in_progress") {
+        warnings.push("stop the active subagent before changing task status");
+      }
+      if (fields.harness !== undefined) {
+        warnings.push("stop the active subagent before changing its harness");
+      }
+      if (warnings.length > 0) return { task: current, changedFields: [], warnings };
+    }
+
     const result = this.deps.getStore().update(taskId, fields);
     if (result.warnings.length > 0 || result.changedFields.length === 0) return result;
 

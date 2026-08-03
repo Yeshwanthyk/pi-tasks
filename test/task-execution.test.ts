@@ -11,15 +11,29 @@ describe("TaskExecution workspace safety", () => {
       "Must run in its origin workspace",
       undefined,
       undefined,
-      "general-purpose",
+      "pi",
       { name: "other", root: "/code/other" },
     );
-    const spawnSubagent = vi.fn(() => Effect.succeed("agent-1"));
+    const spawnSubagent = vi.fn(() => Effect.succeed({
+      id: "agent-1",
+      clientId: "pi-tasks",
+      correlationId: "execution-1",
+      harness: "pi" as const,
+      name: "Run elsewhere",
+      status: "running" as const,
+      cwd: "/code/other",
+    }));
     const execution = new TaskExecution({
       getStore: () => store,
       currentWorkspaceRoot: () => "/code/current",
       spawnSubagent,
-      stopSubagent: () => Effect.void,
+      cancelSubagent: () => Effect.succeed({
+        id: "agent-1",
+        title: "Run elsewhere",
+        status: "error" as const,
+        cancelled: true,
+      }),
+      listSubagents: Effect.succeed([]),
       writeOutput: () => undefined,
       notify: () => {},
       taskNotification: () => "",
@@ -29,7 +43,7 @@ describe("TaskExecution workspace safety", () => {
       onCascadeBlocked: () => {},
       isAutoCascadeEnabled: () => false,
       getCascadeConfig: () => undefined,
-      subscribeSubagentEvent: () => () => {},
+      subscribeSettled: () => () => {},
     });
 
     const result = await Effect.runPromise(execution.executeTasks(["1"]));

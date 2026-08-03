@@ -20,7 +20,7 @@ describe("Effect persistence schemas", () => {
           status: "pending",
           activeForm: undefined,
           owner: undefined,
-          agentType: undefined,
+          harness: undefined,
           execution: undefined,
           project: { name: "pi-tasks", root: "/code/pi-tasks" },
           sessionId: undefined,
@@ -34,6 +34,28 @@ describe("Effect persistence schemas", () => {
     };
 
     expect(decodeTaskStoreData(encodeTaskStoreData(data))).toEqual(data);
+  });
+
+  it("migrates persisted agentType configuration to the pi harness", () => {
+    const migrated = decodeTaskStoreData(JSON.stringify({
+      nextId: 2,
+      tasks: [{
+        id: "1",
+        subject: "Legacy task",
+        description: "Run it",
+        status: "pending",
+        agentType: "general-purpose",
+        metadata: { agentType: "general-purpose" },
+        blocks: [],
+        blockedBy: [],
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+    }));
+
+    expect(migrated.tasks[0].harness).toBe("pi");
+    expect(migrated.tasks[0]).not.toHaveProperty("agentType");
+    expect(migrated.tasks[0].metadata).not.toHaveProperty("agentType");
   });
 
   it("rejects malformed task stores", () => {

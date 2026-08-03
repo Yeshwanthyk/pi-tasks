@@ -1,6 +1,8 @@
 import { Schema } from "effect";
+import { TASK_HARNESSES } from "./types.js";
 
 export const TaskStatusSchema = Schema.Literals(["pending", "in_progress", "completed"]);
+export const TaskHarnessSchema = Schema.Literals(TASK_HARNESSES);
 
 export const TaskProjectSchema = Schema.Struct({
   name: Schema.String,
@@ -31,6 +33,8 @@ const FailedExecutionSchema = Schema.Struct({
   agentId: Schema.NullOr(Schema.String),
   failedAt: Schema.Finite,
   error: Schema.String,
+  result: Schema.optional(Schema.String),
+  outputFile: Schema.optional(Schema.String),
 });
 
 const StoppingExecutionSchema = Schema.Struct({
@@ -64,7 +68,7 @@ export const TaskSchema = Schema.Struct({
   status: TaskStatusSchema,
   activeForm: Schema.optional(Schema.String),
   owner: Schema.optional(Schema.String),
-  agentType: Schema.optional(Schema.String),
+  harness: Schema.optional(TaskHarnessSchema),
   execution: Schema.optional(TaskExecutionStateSchema),
   project: Schema.optional(TaskProjectSchema),
   sessionId: Schema.optional(Schema.String),
@@ -83,7 +87,21 @@ export const TaskStoreDataSchema = Schema.Struct({
 
 const TaskStoreJsonSchema = Schema.fromJsonString(TaskStoreDataSchema);
 
-export const decodeTaskStoreData = Schema.decodeUnknownSync(TaskStoreJsonSchema);
+/** Migrate the legacy agentType field without keeping it in the public task model. */
+export function decodeTaskStoreData(json: string) {
+  const raw = JSON.parse(json) as { tasks?: Array<Record<string, unknown>> };
+  for (const task of raw.tasks ?? []) {
+    const metadata = task.metadata && typeof task.metadata === "object"
+      ? task.metadata as Record<string, unknown>
+      : undefined;
+    const legacyAgentType = typeof task.agentType === "string" || typeof metadata?.agentType === "string";
+    if (task.harness === undefined && legacyAgentType) task.harness = "pi";
+    delete task.agentType;
+    if (metadata) delete metadata.agentType;
+  }
+  return Schema.decodeUnknownSync(TaskStoreDataSchema)(raw);
+}
+
 export const encodeTaskStoreData = Schema.encodeSync(TaskStoreJsonSchema);
 
 export const TasksConfigSchema = Schema.Struct({

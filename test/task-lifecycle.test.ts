@@ -42,6 +42,36 @@ describe("TaskLifecycle status side effects", () => {
     expect(deps.onTasksChanged).not.toHaveBeenCalled();
   });
 
+  it("requires active subagents to stop before status or harness changes", () => {
+    const { store, deps, lifecycle } = setup();
+    store.create("Task", "Desc", undefined, undefined, "pi");
+    store.update("1", {
+      status: "in_progress",
+      execution: {
+        status: "running",
+        executionId: "execution-1",
+        agentId: "agent-1",
+        startedAt: 1,
+      },
+    });
+
+    const result = lifecycle.update("1", {
+      status: "completed",
+      harness: "codex",
+    });
+
+    expect(result.warnings).toEqual([
+      "stop the active subagent before changing task status",
+      "stop the active subagent before changing its harness",
+    ]);
+    expect(store.get("1")).toMatchObject({
+      status: "in_progress",
+      harness: "pi",
+      execution: { status: "running" },
+    });
+    expect(deps.onTasksChanged).not.toHaveBeenCalled();
+  });
+
   it("runs deletion side effects only when a task was deleted", () => {
     const { store, deps, lifecycle } = setup();
     store.create("Task", "Desc");

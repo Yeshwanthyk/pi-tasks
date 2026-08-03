@@ -37,7 +37,7 @@ The persistence mode that determines whether a **Task List** lives in memory, in
 _Avoid_: Storage mode
 
 **Subagent Task**:
-A **Task** configured with an agent type to be executed by a pi subagent through the interactive-subagents integration.
+A **Task** configured with a `pi`, `claude`, or `codex` harness and executed through the pi-subagents client protocol.
 _Avoid_: Agent job
 
 **Task Metadata**:
@@ -75,7 +75,7 @@ _Avoid_: Cleanup
 - A **Task** may have zero or more **Blockers** and may block zero or more other **Tasks**.
 - A **Task** may have at most one **Owner**.
 - An **Active Task** is a **Task** with in-progress status and live widget activity.
-- A **Subagent Task** is a **Task** with agent execution configuration.
+- A **Subagent Task** is a **Task** with a configured execution harness.
 - **Task Metadata** does not contain **Task Execution** state.
 - **Task Execution** is persisted on a **Task** when that **Task** is configured or run as a **Subagent Task**.
 - **Task Execution** may produce output and update the **Task Status**.

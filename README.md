@@ -20,7 +20,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
-- **Subagent integration** — tasks with `agentType` can be executed as subagents via `TaskExecute` (requires [pi-interactive-subagents](https://github.com/Yeshwanthyk/pi-interactive-subagents)). Auto-cascade mode flows through the task DAG automatically when enabled.
+- **Subagent integration** — tasks configured with a `pi`, `claude`, or `codex` harness can run via `TaskExecute` when [pi-subagents](https://github.com/Yeshwanthyk/pi-subagents) is loaded. Auto-cascade mode flows through the task DAG automatically when enabled.
 
 ## Install
 
@@ -64,7 +64,7 @@ Create a structured task. Used proactively for complex multi-step work.
 | `subject` | string | yes | Brief imperative title |
 | `description` | string | yes | Detailed context and acceptance criteria |
 | `activeForm` | string | no | Present continuous form for spinner (e.g., "Running tests") |
-| `agentType` | string | no | Agent type for subagent execution (e.g., `"general-purpose"`, `"Explore"`) |
+| `harness` | `pi` / `claude` / `codex` | no | Harness for subagent execution |
 | `metadata` | object | no | Arbitrary key-value pairs |
 
 ```
@@ -110,6 +110,7 @@ Update task fields, status, metadata, and dependencies.
 | `description` | string | New description |
 | `activeForm` | string | Spinner text |
 | `owner` | string | Agent name |
+| `harness` | `pi` / `claude` / `codex` / `null` | Set or clear the subagent execution harness |
 | `metadata` | object | Shallow merge (null values delete keys) |
 | `addBlocks` | string[] | Task IDs this task blocks |
 | `addBlockedBy` | string[] | Task IDs that block this task |
@@ -152,7 +153,7 @@ Both task IDs and agent IDs (including partial prefixes) are accepted — agent 
 
 ### `TaskStop`
 
-Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC.
+Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a version-1 client cancellation request.
 
 Stopped execution is recorded separately and the task returns to `pending`, ready to resume or retry.
 
@@ -162,16 +163,16 @@ Stopped execution is recorded separately and the task returns to `pending`, read
 
 ### `TaskExecute`
 
-Execute one or more tasks as background subagents. Requires [pi-interactive-subagents](https://github.com/Yeshwanthyk/pi-interactive-subagents).
+Execute one or more tasks as background subagents through [pi-subagents](https://github.com/Yeshwanthyk/pi-subagents).
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `task_ids` | string[] | Task IDs to execute (required) |
 | `additional_context` | string | Extra context appended to each agent's prompt |
-| `model` | string | Model override (e.g., `"sonnet"`, `"haiku"`) |
-| `max_turns` | number | Max turns per agent |
+| `model` | string | Harness-specific model override |
+| `reasoning_effort` | `off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max` | Shared reasoning-effort override |
 
-Tasks must be `pending`, have `agentType` set, and all `blockedBy` dependencies `completed`. Each task spawns as an independent background subagent.
+Tasks must be `pending`, have `harness` set, and all `blockedBy` dependencies `completed`. Each task spawns as an independent background subagent.
 
 Tasks from a named cross-project list can only be executed from their recorded workspace. Use `/tasks all` for cross-project visibility, then open Pi in the owning project to run the task.
 
@@ -268,55 +269,34 @@ Tasks
 
 Run `/tasks all` to show the current shared list grouped by recorded project.
 
-## Cross-extension Communication with [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents)
+## Cross-extension Communication with [`pi-subagents`](https://github.com/Yeshwanthyk/pi-subagents)
 
-[`pi-tasks`](https://github.com/tintinweb/pi-tasks) communicates with [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents) via pi's eventbus using a scoped request/reply RPC protocol. No shared global state — just events.
+`pi-tasks` uses version 1 of the pi-subagents client protocol over pi's event bus. Requests and replies use scoped channels correlated as `<channel>:reply:<requestId>`.
 
-### Presence Detection
+| Operation | Channel |
+|-----------|---------|
+| Presence/version check | `subagents:client:ping` |
+| Spawn | `subagents:client:spawn` |
+| Cancel | `subagents:client:cancel` |
+| Reconcile client-owned agents | `subagents:client:list` |
+| Provider ready broadcast | `subagents:client:ready` |
+| Terminal lifecycle event | `subagents:client:settled` |
 
-Load order doesn't matter. Two handshake paths ensure detection regardless of which extension loads first:
+Spawn requests identify `clientId: "pi-tasks"`, use the task execution ID as `correlationId`, and include the selected `harness`, task name, prompt, working directory, and optional model/reasoning effort. Spawn replies return the normalized client snapshot, including both the correlation and agent ID.
 
-1. **Ping on init** — [`pi-tasks`](https://github.com/tintinweb/pi-tasks) emits `subagents:rpc:ping` with a unique `requestId` and listens for `subagents:rpc:ping:reply:{requestId}`. If [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents) is already loaded, it replies immediately.
-2. **Ready broadcast** — [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents) emits `subagents:ready` when it initializes. If [`pi-tasks`](https://github.com/tintinweb/pi-tasks) loaded first, it picks this up.
+A settlement is applied only when both its `correlationId` and `agentId` match the task's current execution. This prevents a late result from an earlier retry from completing the new run. Outcomes map as follows:
 
-```
-┌─────────────┐                    ┌──────────────────┐
-│  pi-tasks   │                    │  pi-interactive-subagents    │
-└──────┬──────┘                    └────────┬─────────┘
-       │                                    │
-       │──── subagents:rpc:ping ───────────▶│
-       │◀─── subagents:rpc:ping:reply ──────│
-       │                                    │
-       │◀─── subagents:ready ───────────────│  (broadcast on init)
-       │                                    │
-```
+| Outcome | Task state |
+|---------|------------|
+| `completed` | `completed` with stored result |
+| `failed` | `pending` with a failed execution record |
+| `cancelled` | `pending` with a stopped execution record and partial output, when available |
 
-### Spawning Subagents
-
-When `TaskExecute` runs, it sends a spawn RPC with a scoped reply channel:
-
-```
-pi-tasks                                pi-interactive-subagents
-   │                                         │
-   │── subagents:rpc:spawn ─────────────────▶│  { requestId, type, prompt, options }
-   │◀─ subagents:rpc:spawn:reply:{reqId} ───│  { id }  (or { error })
-   │                                         │
-```
-
-The returned `id` is stored in an in-memory `agentTaskMap` (agentId → taskId) for O(1) completion lookup. A 30-second timeout rejects the Promise if no reply arrives.
-
-### Lifecycle Events
-
-[`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents) emits lifecycle events that [`pi-tasks`](https://github.com/tintinweb/pi-tasks) listens to:
-
-| Event | Payload | Action |
-|-------|---------|--------|
-| `subagents:completed` | `{ id, result? }` | Mark task `completed`, trigger auto-cascade if enabled |
-| `subagents:failed` | `{ id, error?, status }` | Revert task to `pending`, store error in metadata |
+On session restoration, `pi-tasks` uses `subagents:client:list` to reconnect persisted running executions that still exist in pi-subagents. Reconciliation is additive and does not guess outcomes for agents absent from the list.
 
 ### Standalone Mode
 
-If [`pi-interactive-subagents`](https://github.com/Yeshwanthyk/pi-interactive-subagents) is not installed, everything works except `TaskExecute`, which returns a friendly error message. All core task tools (create, list, get, update, dependencies, widget, system-reminder injection) function independently.
+If `pi-subagents` is not installed, everything works except `TaskExecute`, which returns a friendly error message. All core task tools, dependencies, persistence, widget behavior, and reminder injection remain independent.
 
 ## Architecture
 
@@ -325,7 +305,8 @@ src/
 ├── index.ts            # Extension entry: 8 tools + /tasks command + widget + subagent integration
 ├── types.ts            # Task, TaskStatus, BackgroundProcess types
 ├── runtime.ts          # One managed Effect v4 runtime and the Promise boundary used by Pi callbacks
-├── effect-errors.ts    # Typed failures for subagent RPC operations
+├── effect-errors.ts    # Typed failures for subagent client operations
+├── subagent-adapter.ts # Version-1 pi-subagents client protocol adapter
 ├── task-schemas.ts     # Effect Schema validation for persisted tasks and settings
 ├── task-store.ts       # File-backed store with CRUD, dependencies, locking
 ├── task-execution.ts   # Effect workflows for spawn, output waiting, stopping, and cascading

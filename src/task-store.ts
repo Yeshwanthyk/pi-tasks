@@ -9,7 +9,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { decodeTaskStoreData, encodeTaskStoreData } from "./task-schemas.js";
-import type { Task, TaskProject, TaskStatus, TaskStoreData } from "./types.js";
+import type { Task, TaskHarness, TaskProject, TaskStatus, TaskStoreData } from "./types.js";
 
 export type ClaimTaskResult =
   | { success: true; task: Task; changedFields: string[] }
@@ -154,12 +154,11 @@ export class TaskStore {
     description: string,
     activeForm?: string,
     metadata?: Record<string, unknown>,
-    agentType?: string,
+    harness?: TaskHarness,
     project?: TaskProject,
     sessionId?: string,
   ): Task {
     return this.withLock(() => {
-      const normalizedAgentType = agentType ?? (typeof metadata?.agentType === "string" ? metadata.agentType : undefined);
       const now = Date.now();
       const id = Math.max(this.nextId, this.highWaterMark + 1);
       this.nextId = id + 1;
@@ -171,7 +170,7 @@ export class TaskStore {
         status: "pending",
         activeForm,
         owner: undefined,
-        agentType: normalizedAgentType,
+        harness,
         project,
         sessionId,
         metadata: metadata ?? {},
@@ -202,7 +201,7 @@ export class TaskStore {
     description?: string;
     activeForm?: string;
     owner?: string;
-    agentType?: string;
+    harness?: TaskHarness | null;
     execution?: Task["execution"];
     metadata?: Record<string, unknown>;
     addBlocks?: string[];
@@ -247,9 +246,9 @@ export class TaskStore {
         task.owner = fields.owner;
         changedFields.push("owner");
       }
-      if (fields.agentType !== undefined) {
-        task.agentType = fields.agentType;
-        changedFields.push("agentType");
+      if (fields.harness !== undefined) {
+        task.harness = fields.harness ?? undefined;
+        changedFields.push("harness");
       }
       if (fields.execution !== undefined) {
         task.execution = fields.execution;
