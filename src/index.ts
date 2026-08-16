@@ -127,6 +127,13 @@ export default function (pi: ExtensionAPI) {
   });
   const widget = new TaskWidget(store);
 
+  pi.registerShortcut("ctrl+alt+t", {
+    description: "Expand/collapse the tasks widget list",
+    handler: () => {
+      widget.toggleExpanded();
+    },
+  });
+
   // ── Subagent integration state ──
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; reasoningEffort?: typeof REASONING_EFFORTS[number] } | undefined;

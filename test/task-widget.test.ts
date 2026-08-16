@@ -34,14 +34,17 @@ function mockUICtx() {
 }
 
 /** Render the widget and return its lines. */
-function renderWidget(state: ReturnType<typeof mockUICtx>["state"]): string[] {
+function renderWidget(state: ReturnType<typeof mockUICtx>["state"], options?: { mode?: "regular" | "fullscreen" }): string[] {
   const entry = state.widgets.get("tasks");
   if (!entry?.content) return [];
   const theme = mockTheme();
-  const tui = { terminal: { columns: 200 }, requestRender() {} };
+  const tui = { terminal: { columns: 200 }, requestRender() {}, mode: options?.mode ?? "regular" };
   const result = entry.content(tui, theme);
   return result.render();
 }
+
+/** One of the star spinner glyphs. */
+const SPINNER_RE = /[✳✴✵✶✷✸✹✺✻✼✽]/;
 
 describe("TaskWidget", () => {
   let store: TaskStore;
@@ -67,16 +70,88 @@ describe("TaskWidget", () => {
     expect(entry?.content).toBeUndefined();
   });
 
-  it("renders pending tasks with ◻ icon", () => {
+  it("renders a collapsed summary by default", () => {
     store.create("Do something", "Desc");
     widget.update();
 
     const lines = renderWidget(ui.state);
-    expect(lines).toHaveLength(2); // header + 1 task
+    // Collapsed: only the summary line — no task rows.
+    expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("1 tasks");
     expect(lines[0]).toContain("1 open");
+    expect(lines[0]).not.toContain("Do something");
+  });
+
+  it("omits zero status counts from the summary", () => {
+    store.create("Task A", "Desc");
+    store.create("Task B", "Desc");
+    store.update("1", { status: "completed" });
+    widget.update();
+
+    const lines = renderWidget(ui.state);
+    expect(lines[0]).toContain("2 tasks");
+    expect(lines[0]).toContain("1 done");
+    expect(lines[0]).not.toContain("0 open");
+    expect(lines[0]).not.toContain("0 in progress");
+  });
+
+  it("shows the running task line only when something is in progress", () => {
+    store.create("Done task", "Desc");
+    store.update("1", { status: "completed" });
+    widget.update();
+
+    let lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(1); // no running line
+
+    store.create("Running task", "Desc");
+    store.update("2", { status: "in_progress" });
+    widget.update();
+
+    lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(2); // summary + running line
+    expect(lines[1]).toContain("#2");
+    expect(lines[1]).toContain("Running task");
+    expect(lines[1]).toContain("◼");
+  });
+
+  it("expands and collapses with toggleExpanded", () => {
+    store.create("Do something", "Desc");
+    widget.update();
+
+    widget.toggleExpanded();
+    let lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(3); // summary + task row + collapse hint
     expect(lines[1]).toContain("◻");
     expect(lines[1]).toContain("Do something");
+
+    widget.toggleExpanded();
+    lines = renderWidget(ui.state);
+    expect(lines).toHaveLength(1); // back to summary
+  });
+
+  it("always renders collapsed in fullscreen mode", () => {
+    store.create("Do something", "Desc");
+    widget.update();
+    widget.toggleExpanded();
+
+    // Expanded in regular mode…
+    expect(renderWidget(ui.state)).toHaveLength(3);
+    // …but fullscreen forces the summary.
+    const lines = renderWidget(ui.state, { mode: "fullscreen" });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("1 open");
+  });
+
+  it("keeps the expand toggle inert in fullscreen mode", () => {
+    store.create("Do something", "Desc");
+    widget.update();
+
+    renderWidget(ui.state, { mode: "fullscreen" });
+    widget.toggleExpanded(); // should not flip the flag
+
+    expect(renderWidget(ui.state, { mode: "fullscreen" })).toHaveLength(1);
+    // And switching back to regular mode stays collapsed.
+    expect(renderWidget(ui.state)).toHaveLength(1);
   });
 
   it("renders in-progress tasks with ◼ icon", () => {
@@ -89,14 +164,15 @@ describe("TaskWidget", () => {
     expect(lines[1]).toContain("Working on it");
   });
 
-  it("renders completed tasks with ✔ icon and strikethrough", () => {
+  it("renders completed tasks with ✔ icon and strikethrough in expanded mode", () => {
     store.create("Done task", "Desc");
     store.update("1", { status: "completed" });
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("✔");
-    expect(lines[1]).toContain("~~#1 Done task~~");
+    expect(lines[1]).toContain("~~Done task~~");
   });
 
   it("renders active tasks with spinner icon", () => {
@@ -105,9 +181,9 @@ describe("TaskWidget", () => {
     widget.setActiveTask("1", true);
 
     const lines = renderWidget(ui.state);
-    // Should show activeForm text with "…" suffix
-    expect(lines[1]).toContain("Processing data…");
-    // Should NOT show ◼ for active task
+    // Summary running line shows activeForm with a spinner.
+    expect(lines[1]).toContain("Processing data");
+    expect(lines[1]).toMatch(SPINNER_RE);
     expect(lines[1]).not.toContain("◼");
   });
 
@@ -125,7 +201,8 @@ describe("TaskWidget", () => {
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("◼");
     expect(lines[1]).toContain("New task same id");
-    expect(lines[1]).not.toContain("New running…");
+    expect(lines[1]).not.toContain("New running");
+    expect(lines[1]).not.toMatch(SPINNER_RE);
   });
 
   it("renders stale manual active tasks as non-spinning in progress", () => {
@@ -138,7 +215,8 @@ describe("TaskWidget", () => {
     expect(lines[1]).toContain("◼");
     expect(lines[1]).toContain("Old manual task");
     expect(lines[1]).toContain("stale 11m");
-    expect(lines[1]).not.toContain("Still running…");
+    expect(lines[1]).not.toContain("Still running");
+    expect(lines[1]).not.toMatch(SPINNER_RE);
   });
 
   it("keeps agent-backed active tasks spinning even after stale threshold", () => {
@@ -148,15 +226,17 @@ describe("TaskWidget", () => {
     widget.setActiveTask("1", true);
 
     const lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("Agent running (agent agent)…");
+    expect(lines[1]).toContain("Agent running");
+    expect(lines[1]).toMatch(SPINNER_RE);
     expect(lines[1]).not.toContain("stale");
   });
 
-  it("shows blocked-by info for pending tasks", () => {
+  it("shows blocked-by info for pending tasks in expanded mode", () => {
     store.create("Blocker", "Desc");
     store.create("Blocked", "Desc");
     store.update("2", { addBlockedBy: ["1"] });
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
     const blockedLine = lines.find(l => l.includes("Blocked"));
@@ -169,6 +249,7 @@ describe("TaskWidget", () => {
     store.update("2", { addBlockedBy: ["1"] });
     store.update("1", { status: "completed" });
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
     const blockedLine = lines.find(l => l.includes("Blocked"));
@@ -200,15 +281,16 @@ describe("TaskWidget", () => {
     expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
   });
 
-  it("limits visible tasks to MAX_VISIBLE_TASKS", () => {
+  it("limits visible tasks to MAX_VISIBLE_TASKS when expanded", () => {
     for (let i = 0; i < 15; i++) {
       store.create(`Task ${i + 1}`, "Desc");
     }
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
-    // header + 10 tasks + "… and 5 more"
-    expect(lines).toHaveLength(12);
+    // summary + 10 tasks + "… and 5 more" + collapse hint
+    expect(lines).toHaveLength(13);
     expect(lines[11]).toContain("5 more");
   });
 
@@ -230,23 +312,25 @@ describe("TaskWidget", () => {
     store.create("Recent done", "Desc"); // #14
     store.update("14", { status: "completed" });
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
-    expect(lines.some(l => l.includes("Doing priority…"))).toBe(true);
+    expect(lines.some(l => l.includes("Doing priority"))).toBe(true);
     expect(lines.some(l => l.includes("Recent done"))).toBe(true);
     expect(lines.some(l => l.includes("Old done 12"))).toBe(false);
   });
 
-  it("tracks token usage for active tasks", () => {
+  it("tracks token usage for active tasks in expanded mode", () => {
     store.create("Active task", "Desc", "Running");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.toggleExpanded();
 
     widget.addTokenUsage(1000, 500);
     widget.addTokenUsage(500, 300);
 
     const lines = renderWidget(ui.state);
-    const activeLine = lines.find(l => l.includes("Running…"));
+    const activeLine = lines.find(l => l.includes("Running"));
     expect(activeLine).toContain("↑ 1.5k");
     expect(activeLine).toContain("↓ 800");
   });
@@ -258,13 +342,14 @@ describe("TaskWidget", () => {
 
     // Should be active (spinner)
     let lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("Doing work…");
+    expect(lines[1]).toContain("Doing work");
+    expect(lines[1]).toMatch(SPINNER_RE);
 
     widget.setActiveTask("1", false);
     lines = renderWidget(ui.state);
-    // Should now show as regular in_progress (◼)
+    // Should now show as regular in_progress (◼), without activeForm
     expect(lines[1]).toContain("◼");
-    expect(lines[1]).not.toContain("Doing work…");
+    expect(lines[1]).not.toContain("Doing work");
   });
 
   it("prunes stale active IDs on update", () => {
@@ -275,24 +360,27 @@ describe("TaskWidget", () => {
     // Complete the task externally
     store.update("1", { status: "completed" });
     widget.update();
+    widget.toggleExpanded();
 
     // Should render as completed, not active
     const lines = renderWidget(ui.state);
     expect(lines[1]).toContain("✔");
-    expect(lines[1]).toContain("~~#1 Task~~");
+    expect(lines[1]).toContain("~~Task~~");
+    expect(lines.some(l => l.includes("stale"))).toBe(false);
   });
 
-  it("supports multiple active tasks simultaneously", () => {
+  it("supports multiple active tasks simultaneously in expanded mode", () => {
     store.create("Task A", "Desc", "Processing A");
     store.create("Task B", "Desc", "Processing B");
     store.update("1", { status: "in_progress" });
     store.update("2", { status: "in_progress" });
     widget.setActiveTask("1", true);
     widget.setActiveTask("2", true);
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("Processing A…");
-    expect(lines[2]).toContain("Processing B…");
+    expect(lines[1]).toContain("Processing A");
+    expect(lines[2]).toContain("Processing B");
   });
 
   it("distributes token usage across all active tasks", () => {
@@ -302,6 +390,7 @@ describe("TaskWidget", () => {
     store.update("2", { status: "in_progress" });
     widget.setActiveTask("1", true);
     widget.setActiveTask("2", true);
+    widget.toggleExpanded();
 
     widget.addTokenUsage(100, 50);
 
@@ -326,7 +415,7 @@ describe("TaskWidget", () => {
     widget.setActiveTask("1", true);
 
     const lines = renderWidget(ui.state);
-    expect(lines[1]).toContain("My Subject…");
+    expect(lines[1]).toContain("My Subject");
   });
 
   it("shows elapsed time but no token arrows when tokens are zero", () => {
@@ -339,7 +428,7 @@ describe("TaskWidget", () => {
     widget.update();
 
     const lines = renderWidget(ui.state);
-    const activeLine = lines.find(l => l.includes("Working…"));
+    const activeLine = lines.find(l => l.includes("Working"));
     expect(activeLine).toContain("5s");
     expect(activeLine).not.toContain("↑");
     expect(activeLine).not.toContain("↓");
@@ -359,6 +448,7 @@ describe("TaskWidget", () => {
     store.create("Task 2", "Desc", "Running");  // ID 2
     store.update("2", { status: "in_progress" });
     widget.setActiveTask("2", true);
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
     // Should not carry over old tokens
@@ -368,6 +458,7 @@ describe("TaskWidget", () => {
   it("indents task lines under header", () => {
     store.create("Indented task", "Desc");
     widget.update();
+    widget.toggleExpanded();
 
     const lines = renderWidget(ui.state);
     // Task line should start with 2 spaces
@@ -453,6 +544,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Small", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.toggleExpanded();
 
     widget.addTokenUsage(500, 200);
     widget.update();
@@ -466,6 +558,7 @@ describe("formatDuration (via widget rendering)", () => {
     store.create("Large", "Desc", "Working");
     store.update("1", { status: "in_progress" });
     widget.setActiveTask("1", true);
+    widget.toggleExpanded();
 
     widget.addTokenUsage(2000, 4100);
     widget.update();

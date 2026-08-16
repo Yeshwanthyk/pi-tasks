@@ -179,6 +179,8 @@ describe("PiTasksHarness scenarios", () => {
 
     const lines = h.renderWidget();
     expect(lines.join("\n")).toContain("Visible");
-    expect(lines.join("\n")).toContain("Visible (agent agent)…");
+    // Collapsed summary: running task with spinner, no agent/token noise.
+    expect(lines.join("\n")).toMatch(/[✳✴✵✶✷✸✹✺✻✼✽] #1 Visible/);
+    expect(lines.join("\n")).not.toContain("agent");
   });
 });

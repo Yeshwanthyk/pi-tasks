@@ -1,11 +1,23 @@
 /**
  * task-widget.ts — Persistent widget showing task list with status icons and progress.
  *
- * Display style matches Claude Code's task list:
- *   ✔ completed tasks (strikethrough + dim)
- *   ◼ in_progress tasks
- *   ◻ pending tasks
- *   ✳/✽ actively executing task (star spinner with activeForm text)
+ * Display philosophy: take as little vertical space as possible.
+ *
+ *   Collapsed (default) — a single summary line:
+ *     ● 12 tasks · 8 done · 1 in progress · 3 open
+ *   …plus one extra line for the currently running task (spinner + duration):
+ *     ✳ #4 Fix pipeline crash… (1m 3s)
+ *
+ *   Expanded (ctrl+alt+t, regular mode only) — the full list with per-task
+ *   status icons, durations, tokens, and blocker info:
+ *     ✳ #4 Fix pipeline crash… (1m 3s · ↑4.1k ↓850 · agent a1b2c)
+ *     ✔ #12 ~~subject~~
+ *     ◼ #3 subject (2m 5s)
+ *     ◻ #9 subject › blocked by #2
+ *
+ * In pi ≥0.84 fullscreen (alt-screen) mode the widget lives in a sticky dock
+ * that shrinks widgets to keep the transcript visible, so the widget always
+ * renders collapsed there.
  */
 
 import { truncateToWidth } from "@earendil-works/pi-tui";
@@ -61,6 +73,9 @@ function formatTokens(n: number): string {
   return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
 }
 
+/** A single task row as returned by the store. */
+type TaskRow = ReturnType<TaskStore["list"]>[number];
+
 // ---- Widget ----
 
 export class TaskWidget {
@@ -81,6 +96,10 @@ export class TaskWidget {
   private tui: any | undefined;
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
+  /** Full-list mode (collapsed by default). Ignored in fullscreen mode. */
+  private expanded = false;
+  /** Last seen TUI mode, used to keep the collapse toggle inert in fullscreen. */
+  private lastMode: "regular" | "fullscreen" | undefined;
 
   constructor(private store: TaskStore) {}
 
@@ -104,6 +123,15 @@ export class TaskWidget {
 
   setUICtx(ctx: UICtx) {
     this.uiCtx = ctx;
+  }
+
+  /** Toggle between the one-line summary and the full list. */
+  toggleExpanded() {
+    // Fullscreen mode auto-compacts the widget; keep the toggle inert there so
+    // the flag doesn't silently flip for the next regular-mode session.
+    if (this.lastMode === "fullscreen") return;
+    this.expanded = !this.expanded;
+    this.update();
   }
 
   /** Add or remove a task from the active spinner set. */
@@ -182,41 +210,86 @@ export class TaskWidget {
     return [...recentCompleted, ...inProgress, ...pendingUnblocked, ...pendingBlocked, ...olderCompleted].slice(0, MAX_VISIBLE_TASKS);
   }
 
-  /** Build widget lines from current live state. Called from the render callback. */
-  private renderWidget(tui: any, theme: Theme): string[] {
-    const tasks = this.store.list();
-    this.observeCompletionTransitions(tasks);
-    const w = tui.terminal.columns;
-    const truncate = (line: string) => truncateToWidth(line, w);
+  /** Resolve when a task started, preferring live execution state. */
+  private startedAtOf(task: TaskRow) {
+    const metric = this.metrics.get(task.id);
+    const legacyStartedAt = typeof task.metadata?.startedAt === "number" ? task.metadata.startedAt : undefined;
+    return task.execution?.status === "running" ? task.execution.startedAt : legacyStartedAt ?? metric?.startedAt;
+  }
 
-    if (tasks.length === 0) return [];
-
-    const completed = tasks.filter(t => t.status === "completed");
-    const inProgress = tasks.filter(t => t.status === "in_progress");
-    const pending = tasks.filter(t => t.status === "pending");
+  /** One-line status summary: "● 12 tasks · 8 done · 1 in progress · 3 open". */
+  private summaryLine(theme: Theme, tasks: ReturnType<TaskStore["list"]>): string {
+    const completed = tasks.filter(t => t.status === "completed").length;
+    const inProgress = tasks.filter(t => t.status === "in_progress").length;
+    const pending = tasks.filter(t => t.status === "pending").length;
 
     const parts: string[] = [];
-    if (completed.length > 0) parts.push(`${completed.length} done`);
-    if (inProgress.length > 0) parts.push(`${inProgress.length} in progress`);
-    if (pending.length > 0) parts.push(`${pending.length} open`);
-    const statusText = `${tasks.length} tasks (${parts.join(", ")})`;
+    if (completed > 0) parts.push(theme.fg("success", `${completed} done`));
+    if (inProgress > 0) parts.push(theme.fg("accent", `${inProgress} in progress`));
+    if (pending > 0) parts.push(theme.fg("dim", `${pending} open`));
+    const statusText = theme.fg("accent", `${tasks.length} tasks`) + " · " + parts.join(" · ");
 
+    return theme.fg("accent", "●") + " " + statusText;
+  }
+
+  /** Per-task state needed by both render variants. */
+  private taskState(task: TaskRow, now: number) {
+    const startedAt = this.startedAtOf(task);
+    const agentId = executionAgentId(task);
+    const isStaleManual = task.status === "in_progress" && !agentId &&
+      typeof startedAt === "number" && now - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
+    const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress" && !isStaleManual;
+    const elapsed = typeof startedAt === "number" && task.status === "in_progress"
+      ? formatDuration(now - startedAt)
+      : undefined;
+    return { startedAt, agentId, isStaleManual, isActive, elapsed };
+  }
+
+  /** Build the collapsed widget: summary line (+ running task line). */
+  private renderSummary(tui: any, theme: Theme, tasks: ReturnType<TaskStore["list"]>): string[] {
+    const w = tui.terminal.columns;
+    const truncate = (line: string) => truncateToWidth(line, w);
     const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
-    const lines: string[] = [truncate(theme.fg("accent", "●") + " " + theme.fg("accent", statusText))];
+    const now = Date.now();
+
+    const lines = [truncate(this.summaryLine(theme, tasks))];
+
+    const running = tasks
+      .filter(t => t.status === "in_progress")
+      .sort((a, b) => Number(this.activeTaskIds.has(b.id)) - Number(this.activeTaskIds.has(a.id)))
+      .find(() => true);
+
+    if (running) {
+      const state = this.taskState(running, now);
+      const icon = state.isActive ? theme.fg("accent", spinnerChar) : theme.fg("accent", "◼");
+      const subject = running.activeForm && state.isActive ? running.activeForm : running.subject;
+      let suffix = "";
+      if (state.isStaleManual) {
+        suffix = ` ${theme.fg("warning", `(stale ${state.elapsed})`)}`;
+      } else if (state.elapsed) {
+        suffix = ` ${theme.fg("dim", `(${state.elapsed})`)}`;
+      }
+      lines.push(truncate(`  ${icon} ${theme.fg("dim", "#" + running.id)} ${theme.fg("accent", subject)}${suffix}`));
+    }
+
+    return lines;
+  }
+
+  /** Build the expanded widget: summary line + full task list. */
+  private renderExpanded(tui: any, theme: Theme, tasks: ReturnType<TaskStore["list"]>): string[] {
+    const w = tui.terminal.columns;
+    const truncate = (line: string) => truncateToWidth(line, w);
+    const spinnerChar = SPINNER[this.widgetFrame % SPINNER.length];
+    const now = Date.now();
+
+    const lines: string[] = [truncate(this.summaryLine(theme, tasks))];
 
     const visible = this.visibleTasks(tasks);
-    for (let i = 0; i < visible.length; i++) {
-      const task = visible[i];
-      const metric = this.metrics.get(task.id);
-      const legacyStartedAt = typeof task.metadata?.startedAt === "number" ? task.metadata.startedAt : undefined;
-      const startedAt = task.execution?.status === "running" ? task.execution.startedAt : legacyStartedAt ?? metric?.startedAt;
-      const agentId = executionAgentId(task);
-      const isStaleManual = task.status === "in_progress" && !agentId &&
-        typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
-      const isActive = this.activeTaskIds.has(task.id) && task.status === "in_progress" && !isStaleManual;
+    for (const task of visible) {
+      const state = this.taskState(task, now);
 
       let icon: string;
-      if (isActive) {
+      if (state.isActive) {
         icon = theme.fg("accent", spinnerChar);
       } else if (task.status === "completed") {
         icon = theme.fg("success", "✔");
@@ -226,52 +299,67 @@ export class TaskWidget {
         icon = "◻";
       }
 
-      let suffix = "";
+      // Subject, truncated to the remaining width.
+      const subject = task.status === "completed"
+        ? theme.fg("dim", theme.strikethrough(task.subject))
+        : state.isActive && task.activeForm
+          ? theme.fg("accent", task.activeForm)
+          : task.subject;
+
+      let text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${subject}`;
+
+      // Meta: duration, tokens, agent — only while the task is live.
+      if (task.status === "in_progress") {
+        const meta: string[] = [];
+        if (state.isActive) {
+          const m = this.metrics.get(task.id);
+          if (m) {
+            if (state.elapsed) meta.push(state.elapsed);
+            const tokenParts: string[] = [];
+            if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
+            if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
+            if (tokenParts.length > 0) meta.push(tokenParts.join(" "));
+          }
+          if (state.agentId) meta.push(`agent ${state.agentId.slice(0, 5)}`);
+        }
+        if (state.isStaleManual) {
+          text += theme.fg("warning", ` (stale ${state.elapsed})`);
+        } else if (meta.length > 0) {
+          text += ` ${theme.fg("dim", `(${meta.join(" · ")})`)}`;
+        }
+      }
+
+      // Blocked-by hint for pending tasks.
       if (task.status === "pending" && task.blockedBy.length > 0) {
         const blockers = openExistingBlockers(task, id => this.store.get(id));
         if (blockers.length > 0) {
-          suffix = theme.fg("dim", ` › blocked by ${blockers.map(id => "#" + id).join(", ")}`);
+          text += theme.fg("dim", ` › blocked by ${blockers.map(id => "#" + id).join(", ")}`);
         }
       }
 
-      let text: string;
-      if (isActive) {
-        const form = task.activeForm || task.subject;
-        const agentId = executionAgentId(task);
-        const agentLabel = agentId ? ` (agent ${agentId.slice(0, 5)})` : "";
-        const m = metric;
-        let stats = "";
-        if (m) {
-          const elapsed = formatDuration(Date.now() - m.startedAt);
-          const tokenParts: string[] = [];
-          if (m.inputTokens > 0) tokenParts.push(`↑ ${formatTokens(m.inputTokens)}`);
-          if (m.outputTokens > 0) tokenParts.push(`↓ ${formatTokens(m.outputTokens)}`);
-          stats = tokenParts.length > 0
-            ? ` ${theme.fg("dim", `(${elapsed} · ${tokenParts.join(" ")})`)}`
-            : ` ${theme.fg("dim", `(${elapsed})`)}`;
-        }
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${theme.fg("accent", form + agentLabel + "…")}${stats}`;
-      } else if (task.status === "completed") {
-        text = `  ${icon} ${theme.fg("dim", theme.strikethrough("#" + task.id + " " + task.subject))}`;
-      } else {
-        const agentId = executionAgentId(task);
-        const agentSuffix = task.status === "in_progress" && agentId
-          ? theme.fg("dim", ` (agent ${agentId.slice(0, 5)})`)
-          : "";
-        const staleSuffix = isStaleManual && typeof startedAt === "number"
-          ? theme.fg("warning", ` (stale ${formatDuration(Date.now() - startedAt)})`)
-          : "";
-        text = `  ${icon} ${theme.fg("dim", "#" + task.id)} ${task.subject}${agentSuffix}${staleSuffix}`;
-      }
-
-      lines.push(truncate(text + suffix));
+      lines.push(truncate(text));
     }
 
     if (tasks.length > MAX_VISIBLE_TASKS) {
       lines.push(truncate(theme.fg("dim", `    … and ${tasks.length - MAX_VISIBLE_TASKS} more`)));
     }
+    lines.push(truncate(theme.fg("dim", "  ctrl+alt+t collapse")));
 
     return lines;
+  }
+
+  /** Build widget lines from current live state. Called from the render callback. */
+  private renderWidget(tui: any, theme: Theme): string[] {
+    const tasks = this.store.list();
+    this.observeCompletionTransitions(tasks);
+    this.lastMode = tui?.mode;
+
+    if (tasks.length === 0) return [];
+    // In fullscreen mode the dock shrinks widgets; always render the summary there.
+    if (this.lastMode === "fullscreen" || !this.expanded) {
+      return this.renderSummary(tui, theme, tasks);
+    }
+    return this.renderExpanded(tui, theme, tasks);
   }
 
   /** Force an immediate widget update. */
@@ -304,13 +392,8 @@ export class TaskWidget {
 
     // Check if any task needs animation
     const hasActiveSpinner = tasks.some(t => {
-      const metric = this.metrics.get(t.id);
-      const legacyStartedAt = typeof t.metadata?.startedAt === "number" ? t.metadata.startedAt : undefined;
-      const startedAt = t.execution?.status === "running" ? t.execution.startedAt : legacyStartedAt ?? metric?.startedAt;
-      const agentId = executionAgentId(t);
-      const isStaleManual = !agentId &&
-        typeof startedAt === "number" && Date.now() - startedAt >= MANUAL_TASK_STALE_AFTER_MS;
-      return this.activeTaskIds.has(t.id) && t.status === "in_progress" && !isStaleManual;
+      const state = this.taskState(t, Date.now());
+      return state.isActive;
     });
     if (hasActiveSpinner) {
       this.ensureTimer();
@@ -325,6 +408,7 @@ export class TaskWidget {
     if (!this.widgetRegistered) {
       this.uiCtx.setWidget("tasks", (tui, theme) => {
         this.tui = tui;
+        this.lastMode = tui?.mode;
         return { render: () => this.renderWidget(tui, theme), invalidate: () => {} };
       }, { placement: "aboveEditor" });
       this.widgetRegistered = true;

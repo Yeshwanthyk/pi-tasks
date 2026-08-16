@@ -102,6 +102,9 @@ function createMockPi() {
   const pi = {
     registerTool(def: any) { tools.set(def.name, def); },
     registerCommand(name: string, def: any) { commands.set(name, def); },
+    registerShortcut(name: string, def: any) {
+      // No-op: shortcut handlers are exercised through the widget API directly.
+    },
     on(event: string, handler: any) {
       if (!lifecycleHandlers.has(event)) lifecycleHandlers.set(event, []);
       lifecycleHandlers.get(event)!.push(handler);
